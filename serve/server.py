@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.request_lifecycle import AdmissionQueue, ExecutionStalled, QueueWaitExpired, RequestLifecycle, lifecycle  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -413,6 +414,7 @@ class MockEngine:
         self.last_prompt: list[int] = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        lifecycle(cancel).executing(len(ids), 0)
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
         if len(self.scripts) > 1:
@@ -451,10 +453,6 @@ class ClientGone(Exception):
 
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
-
-
-class QueueWaitExpired(RuntimeError):
-    """An inference call waited too long for its first engine turn."""
 
 
 class QueueCancelled(RuntimeError):
@@ -1099,14 +1097,6 @@ class _RequestOwned:
         self._store(obj)[self.name] = value
 
 
-class _MultiAdmission:
-    def __init__(self, proc, capacity):
-        self.proc, self.capacity = proc, capacity
-        self.cv = threading.Condition()
-        self.waiting = collections.deque()
-        self.active = 0
-
-
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1392,7 +1382,8 @@ class StrataEngine:
         self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
         # DeepSeek's native waiting queue emits no progress. Keep excess requests here, before GEN and its
         # execution watchdog. Each process owns its gate; old waiters must not enter a restarted engine.
-        self.multi_admission = _MultiAdmission(self.proc, self.multi) if self.multi else None
+        self.admission = AdmissionQueue(self.proc, self.multi) if self.multi else None
+        self._control_request = None
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -1815,6 +1806,15 @@ class StrataEngine:
         threading.Thread(target=run, daemon=True).start()
 
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None):
+        request = lifecycle(cancel)
+        self._control_request = request
+        try:
+            yield from self._read_control(cancel, on_token, stop_when, on_quiet, want_lp, lines_q)
+        finally:
+            if self._control_request is request:
+                self._control_request = None
+
+    def _read_control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False, lines_q=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
@@ -1824,7 +1824,7 @@ class StrataEngine:
         slot's `BT` lines carry none), so a request asking for logprobs there is a `max_tokens` 1 one: read the
         line here, for the request itself (its own lines: the engine's is shared by the slots' readers)."""
         stopped = False
-        beat = time.monotonic()
+        request = lifecycle(cancel)
         held = NO_LINE                               # a line read while looking for a token's LP line
         lines_q = self.lines if lines_q is None else lines_q   # #4451: the request's own engine's lines (a restart makes new ones)
 
@@ -1834,22 +1834,19 @@ class StrataEngine:
         while True:
             if held is not NO_LINE:
                 line, held = held, NO_LINE
+                request.progress(line)
             else:
-                try:
-                    # A client can leave before the first PP/token.  Poll its Event as often as _take_control does;
-                    # the ten-second HTTP heartbeat is independent of how promptly STOP reaches the engine.
-                    line = lines_q.get(timeout=0.5)
-                except queue.Empty:
+                # Poll cancellation independently of the HTTP heartbeat interval.
+                line = self._execution_line(request, lines_q)
+                if line is NO_LINE:
                     if cancel.is_set() and not stopped:
                         send_stop()
                         stopped = True
                     if on_quiet is not None:
                         on_quiet()
-                    if time.monotonic() - beat >= 10.0:
-                        beat = time.monotonic()
+                    if request.heartbeat():
                         yield None
                     continue
-            beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
             if not line.startswith(("PP ", "INFO")):
@@ -2088,17 +2085,19 @@ class StrataEngine:
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+        request = lifecycle(cancel)
+        if getattr(cancel, "_strata_preslot", None) is None:
+            request.queued()
         entry = [plen, time.monotonic(), new, prompt, cancel]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST; the prompt and request, for STRATA_COALESCE_PREFILL)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
             self.arrivals.append(entry[1])
-        beat = time.monotonic()
         try:
             while True:
-                deadline = getattr(cancel, "_strata_queue_deadline", None)
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                left = request.queue_wait()
+                if not left:
+                    return False
                 if not self.alive() and not getattr(self, "starting", False):
                     # #1012: the engine is gone and nobody is starting it again: this request was not sent, so it
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
@@ -2108,7 +2107,6 @@ class StrataEngine:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                     if turn and new and ADMIT_SHORT_FIRST > 0:
                         turn = self._admit_next() is entry
-                left = deadline - time.monotonic() if deadline is not None else 0.5
                 if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
                     if new and ADMIT_SHORT_FIRST > 0:
                         with self.slot_cv:              # a shorter one came while this one waited in acquire()
@@ -2119,9 +2117,13 @@ class StrataEngine:
                                 self.slot_cv.notify_all()
                             continue
                     if self.alive():
-                        if deadline is not None and time.monotonic() >= deadline:
+                        try:
+                            if not request.queue_wait():
+                                self.ctl.release()
+                                return False
+                        except QueueWaitExpired:
                             self.ctl.release()
-                            raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            raise
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
                     turn = False                        # the lines: not the engine this request was meant for
@@ -2137,8 +2139,7 @@ class StrataEngine:
                             self.slot_cv.wait(timeout=min(0.5, max(0, left)))
                 if cancel.is_set():
                     return False
-                if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
-                    beat = time.monotonic()
+                if request.heartbeat():
                     yield None
         finally:
             with self.slot_cv:
@@ -2193,6 +2194,11 @@ class StrataEngine:
                     continue
                 if getattr(rq, "_strata_co", False) or len(prompt) < 32 or total + len(prompt) > COALESCE_TOKENS:
                     continue
+                try:
+                    if not lifecycle(rq).queue_wait():
+                        continue
+                except QueueWaitExpired:
+                    continue
                 slot = self.pick_slot(prompt)
                 if slot is None:
                     break
@@ -2202,8 +2208,15 @@ class StrataEngine:
                 rq._strata_preslot = slot
                 rq._strata_co = True
                 total += len(prompt)
-                picked.append((slot, prompt))
-        for slot, prompt in picked:
+                picked.append((slot, prompt, rq))
+        for slot, prompt, rq in picked:
+            # The control reader's watchdog covers this combined prefill. The follower
+            # is executing too: it must no longer expire under its queue deadline.
+            try:
+                self._execution_start(rq, len(prompt))
+            except (QueueWaitExpired, QueueCancelled):
+                self._release_preslot(rq)
+                continue
             self._send(f"BCO {slot} {','.join(str(int(t)) for t in prompt)}")
         if picked:
             print(f"[strata] coalesce: {len(picked)} waiting prompt(s) ({total - len(lead_prompt)} tokens) read with this "
@@ -2296,15 +2309,8 @@ class StrataEngine:
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"GENI {left}{keys}{pf} {embeddings}" if embeddings else f"GEN {left}{keys}{pf}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
-                    deadline = getattr(cancel, "_strata_queue_deadline", None)
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    self._execution_start(cancel, len(prompt))
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    if deadline is not None:
-                        cancel._strata_queue_deadline = None
-                    started = getattr(cancel, "_strata_queue_started", None)
-                    if started is not None:
-                        started()
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -2357,6 +2363,8 @@ class StrataEngine:
                         carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
                                                             # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+                if slot is None:
+                    lifecycle(cancel).queued()
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
@@ -2365,9 +2373,9 @@ class StrataEngine:
                         # that gave way (BYIELD) and needs them to go on, so waiting with them is a deadlock - long,
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
-                            deadline = getattr(cancel, "_strata_queue_deadline", None)
-                            if deadline is not None and time.monotonic() >= deadline:
-                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            request = lifecycle(cancel)
+                            if not request.queue_wait():
+                                return
                             with self.slot_cv:
                                 slot = self.pick_slot(prompt)
                                 if slot is not None:
@@ -2399,7 +2407,7 @@ class StrataEngine:
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
                                 if self.pick_slot(prompt) is None:
-                                    wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
+                                    wait_remaining = request.queue_wait()
                                     self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
                             if cancel.is_set():
                                 return
@@ -2431,19 +2439,12 @@ class StrataEngine:
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
                             "started": time.time(), "first_token": None}
-                    deadline = getattr(cancel, "_strata_queue_deadline", None)
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     if COALESCE_PREFILL > 1 and not embeddings:
                         self._coalesce(cancel, prompt)
+                    self._execution_start(cancel, len(prompt))
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    if deadline is not None:
-                        cancel._strata_queue_deadline = None
-                    started = getattr(cancel, "_strata_queue_started", None)
-                    if started is not None:
-                        started()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -2510,16 +2511,17 @@ class StrataEngine:
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
-                    try:
-                        line = sq[slot].get(timeout=10.0)
-                    except queue.Empty:
+                    request = lifecycle(cancel)
+                    line = self._execution_line(request, sq[slot], native_slot=True)
+                    if line is NO_LINE:
                         if self.gen != born:                # #4451: the engine it was admitted on is gone (and so is its slot)
                             phase = "none"
                             raise EngineDied("the engine restarted while this request was running; it was not completed")
                         if cancel.is_set() and not stop_sent:
                             self._send_for(born, f"BSTOP {slot}")
                             stop_sent = True
-                        yield None
+                        if request.heartbeat():
+                            yield None
                         continue
                     if line is None:
                         phase = "none"
@@ -2736,49 +2738,66 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
-        """Yield tokens and keepalives; DeepSeek waits FIFO for capacity before its execution watchdog starts."""
-        if not self.multi:
-            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
-            return
-        admission = self.multi_admission
-        ticket = object()
+        """Expose one lifecycle while the protocol adapter owns native admission and its wire format."""
+        request = lifecycle(cancel, heartbeat_s=QUEUE_BEAT_S)
         claimed = False
-        beat = time.monotonic()
-        deadline = getattr(cancel, "_strata_queue_deadline", None)
-        with admission.cv:
-            admission.waiting.append(ticket)
+        admission = self.admission if self.multi else None
         try:
-            while True:
-                with admission.cv:
-                    if cancel.is_set():
-                        return
-                    if self.proc is not admission.proc or not self.alive():
-                        raise EngineDied("the engine stopped while this request was waiting for a conversation")
-                    left = deadline - time.monotonic() if deadline is not None else 0.5
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    if admission.waiting[0] is ticket and admission.active < admission.capacity:
-                        admission.waiting.popleft()
-                        admission.active += 1
-                        claimed = True
-                        admission.cv.notify_all()
-                        break
-                    admission.cv.wait(timeout=min(0.5, left))
-                if time.monotonic() - beat >= QUEUE_BEAT_S:
-                    beat = time.monotonic()
-                    yield None
             if cancel.is_set():
                 return
-            cancel._strata_queue_deadline = None
-            # Keep the permit through STOP/DONE cleanup: the native conversation is still occupied until then.
-            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only, _proc=admission.proc)
+            if admission is not None:
+                def valid(proc):
+                    if self.proc is not proc or not self.alive():
+                        raise EngineDied("the engine stopped while this request was waiting for a conversation")
+                claimed = yield from admission.acquire(request, valid)
+                if not claimed or cancel.is_set():
+                    return
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only,
+                                      _proc=admission.owner if admission is not None else None)
         finally:
-            with admission.cv:
-                if claimed:
-                    admission.active -= 1
-                else:
-                    admission.waiting.remove(ticket)
-                admission.cv.notify_all()
+            if claimed:
+                admission.release()
+            request.finished()
+
+    def _execution_start(self, cancel, prompt_tokens):
+        request = lifecycle(cancel, heartbeat_s=QUEUE_BEAT_S)
+        if not request.queue_wait():  # queue policy applies until native submission, for every protocol
+            raise QueueCancelled("the client disconnected while waiting for the engine")
+        request.executing(prompt_tokens, self.silence_s, owner=self.proc, chunk_max=PP_CHUNK_MAX,
+                          prompt_floor=PP_FLOOR_TOK_S, prompt_slack=PP_SLACK)
+        return request
+
+    def _execution_line(self, request, lines_q, *, native_slot=False):
+        def check_owner():
+            if request.owner is not None and self.proc is not request.owner:
+                raise EngineDied("the engine restarted while this request was running; it was not completed")
+        check_owner()
+        def scheduler_state():
+            if native_slot:
+                control = self._control_request
+                # This protocol pauses slot decode while the control reader runs GEN/BGEN.
+                # Its own watchdog remains armed; the paused slots retain their remaining time.
+                request.execution_paused(control is not None and control is not request
+                                         and control.owner is request.owner)
+        scheduler_state()
+        try:
+            wait = request.execution_wait()
+            try:
+                line = lines_q.get(timeout=wait)
+            except queue.Empty:
+                check_owner()
+                scheduler_state()
+                if not request.cancel.is_set():
+                    request.execution_wait()  # an expired execution deadline is never a keepalive
+                    if request.heard is not None and request.paused_at is None and (ENGINE_STALL_S or 0) > 0:
+                        self._stall_check(request.heard, request.stall_state, ENGINE_STALL_S, proc=request.owner)
+                return NO_LINE
+        except ExecutionStalled as exc:
+            raise self._silent(str(exc), proc=request.owner) from None
+        check_owner()
+        if line is not None:
+            request.progress(line)
+        return line
 
     def _generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, _proc=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
@@ -2797,11 +2816,12 @@ class StrataEngine:
         # lines come on a queue of their own and its STOP names it.  One at a time (self.multi 0): the one queue, as before.
         rid, lines_q, stop_line = None, self.lines, "STOP\n"
         if self.multi:
+            rid_queues = self.rid_q
             with self.rid_lock:
                 self.rid_n += 1
                 rid = self.rid_n
             lines_q = queue.Queue()
-            self.rid_q[rid] = lines_q
+            rid_queues[rid] = lines_q
             stop_line = f"STOP {rid}\n"
         # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same
         # flush), read here before the token is yielded, so whoever takes the token finds its line in
@@ -2818,64 +2838,40 @@ class StrataEngine:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = f"GEN 0 prefill=1{rid_key}"
         try:
+            request = self._execution_start(cancel, len(ids))
             if rid is not None:                          # several requests write to the engine at once
                 self._send(f"{head} {','.join(str(int(t)) for t in ids)}", proc=_proc)
             else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-                self.proc.stdin.flush()
-        except (OSError, EngineDied) as exc:             # the pipe is gone: the engine died (not the client)
+                request.owner.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                request.owner.stdin.flush()
+        except (OSError, EngineDied, QueueWaitExpired, QueueCancelled) as exc:
             if rid is not None:
-                self.rid_q.pop(rid, None)
-            if isinstance(exc, EngineDied):
+                rid_queues.pop(rid, None)
+            if isinstance(exc, (EngineDied, QueueWaitExpired, QueueCancelled)):
                 raise
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
-        # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
-        # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
-        silence = float(self.silence_s or 0)
-        allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
-        heard, read_to = time.monotonic(), 0
-        beat = heard
-        stall_s = ENGINE_STALL_S or 0.0
-        stall_state: dict = {}
         try:
             while True:
-                wait = 10.0
-                if allow > 0:
-                    wait = min(wait, allow - (time.monotonic() - heard))
-                    if wait <= 0:
-                        done = True                       # no STOP and no drain: nothing is listening
-                        raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
-                                           "the request")
                 try:
-                    if carry is not NO_LINE:              # the line read after a token for its LP line
+                    if carry is not NO_LINE:
                         line, carry = carry, NO_LINE
+                        request.progress(line)
                     else:
-                        line = lines_q.get(timeout=min(wait, 0.5))
-                except queue.Empty:
+                        line = self._execution_line(request, lines_q)
+                except EngineSilent:
+                    done = True
+                    raise
+                if line is NO_LINE:
                     if cancel.is_set():
                         return
-                    if stall_s > 0:
-                        try:
-                            self._stall_check(heard, stall_state, stall_s)
-                        except EngineSilent:
-                            done = True                   # as above: nothing is listening
-                            raise
-                    if allow > 0 and time.monotonic() - heard >= allow:
-                        continue                          # enforce the expired deadline before another heartbeat
-                    if time.monotonic() - beat >= 10.0:
-                        beat = time.monotonic()
-                        yield None                        # polling cancellation does not add HTTP heartbeats
+                    if request.heartbeat():
+                        yield None
                     continue
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
-                beat = heard
-                if stall_state:
-                    stall_state.clear()
                 if line.startswith("T "):
-                    allow = silence
                     if cancel.is_set():
                         return
                     t = int(line[2:])
@@ -2896,16 +2892,12 @@ class StrataEngine:
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                         self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
-                        rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
-                        read_to = int(f[1])
-                        if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
-                            allow = max(silence, PP_SLACK * chunk / rate)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
-                        read_to = self.reused = int(line.split()[1])
+                        self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
@@ -2920,17 +2912,18 @@ class StrataEngine:
                     self._swallow_trailing_done(lines_q)  # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
+            if not done and self.proc is request.owner:  # never stop/drain a replacement process
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write(stop_line)
-                        self.proc.stdin.flush()
+                        request.owner.stdin.write(stop_line)
+                        request.owner.stdin.flush()
                     except OSError:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
                 heard = time.monotonic()
+                allow = request.allow_s
                 while True:
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
@@ -2942,7 +2935,7 @@ class StrataEngine:
                             line = lines_q.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
-                                           f"within {allow:.0f} s") from None
+                                           f"within {allow:.0f} s", proc=request.owner) from None
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -2951,7 +2944,7 @@ class StrataEngine:
                     if not self.can_stop:
                         heard = time.monotonic()
             if rid is not None:                           # this request's lines are over (a late one goes nowhere)
-                self.rid_q.pop(rid, None)
+                rid_queues.pop(rid, None)
 
     @staticmethod
     def _swallow_trailing_done(lines_q, wait: float = 0.3) -> None:
@@ -2982,7 +2975,7 @@ class StrataEngine:
         except Exception:  # noqa: BLE001 - psutil missing, the process gone, no permission: no reading
             return None
 
-    def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
+    def _stall_check(self, heard: float, state: dict, stall_s: float, *, proc=None) -> None:
         """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
         compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one warning."""
         age = time.monotonic() - heard
@@ -2998,7 +2991,7 @@ class StrataEngine:
             gpu_working = False
         if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
-                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+                               "STRATA_ENGINE_STALL_S sets this, 0 = off)", proc=proc)
         if now is not None:   # working: look again after another window from here, and say so once
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
@@ -3008,14 +3001,16 @@ class StrataEngine:
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
-    def _silent(self, what: str) -> EngineSilent:
+    def _silent(self, what: str, *, proc=None) -> EngineSilent:
         """#481: end an engine that lost step with the server (its main thread waits for a command the server never
         sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
+        proc = self.proc if proc is None else proc
+        if self.proc is not proc:
+            raise EngineDied("the engine restarted while this request was running; it was not completed")
         self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
                             "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
                             "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
         self.ended = True                               # not alive from now: the next request restarts it
-        proc = self.proc
         try:
             proc.kill()
             proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
@@ -5010,24 +5005,16 @@ class Service:
                     self.client_disconnect_cancels += 1
 
     @contextlib.contextmanager
-    def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
-        if deadline is None:
-            with self.fifo:
-                yield
-            return
+    def _inference_fifo(self, request):
         while True:
-            if cancel is not None and cancel.is_set():
+            left = request.queue_wait()
+            if not left:
                 raise QueueCancelled("the client disconnected while waiting for the engine")
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
             if self.fifo.acquire(timeout=min(0.1, left)):
                 break
         try:
-            if cancel is not None and cancel.is_set():
+            if not request.queue_wait():
                 raise QueueCancelled("the client disconnected while waiting for the engine")
-            if time.monotonic() >= deadline:
-                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
             yield
         finally:
             self.fifo.release()
@@ -6350,13 +6337,6 @@ class Service:
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
-        def queue_started():
-            with self.status_lock:
-                row = self.terminal_requests.get(request_id)
-                if row is not None and row["state"] != "reading":
-                    row["state"] = "reading"
-                    self._terminal_event_locked(request_id, "reading")
-        setattr(cancel, "_strata_queue_started", queue_started)
         def replica_selected(index: int) -> None:
             with self.status_lock:
                 row = self.terminal_requests.get(request_id)
@@ -6365,11 +6345,41 @@ class Service:
         setattr(cancel, "_strata_replica_selected", replica_selected)
         with self.status_lock:
             self.status["queued"] += 1
-            self.terminal_requests[request_id] = {"id": request_id, "state": "queued",
+            self.terminal_requests[request_id] = {"id": request_id, "state": "waiting" if par else "queued",
                                                     "queued_at": time.time(), "admitted_at": None,
                                                     "prompt_tokens": len(ids)}
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
+        request = RequestLifecycle(cancel, heartbeat_s=QUEUE_BEAT_S)
+        cancel._strata_lifecycle = request
+
+        def state_changed(phase):
+            nonlocal queued_counted
+            if phase not in ("queued", "executing"):
+                return
+            with self.status_lock:
+                row = self.terminal_requests.get(request_id)
+                if row is None:
+                    return
+                if phase == "queued":
+                    if not queued_counted:
+                        self.status["queued"] += 1
+                        queued_counted = True
+                    row["state"] = "waiting" if par else "queued"
+                    st["phase"] = "waiting"
+                    self._terminal_event_locked(request_id, "queued")
+                else:
+                    if queued_counted:
+                        self.status["queued"] -= 1
+                        queued_counted = False
+                    row.update(state="reading", admitted_at=time.time())
+                    st["phase"] = "reading the prompt"
+                    self._terminal_event_locked(request_id, "admitted")
+                    self._terminal_event_locked(request_id, "reading")
+                    if trace is not None:
+                        trace["queue_s"] = round(request.queue_s, 3)
+                        trace["state"] = "generating"
+        request.changed = state_changed
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
@@ -6379,33 +6389,22 @@ class Service:
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
                 while not got:
-                    if cancel.is_set():
+                    left = request.queue_wait()
+                    if not left:
                         raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
+                    got = self.fifo.acquire(timeout=left)
                     if got:
-                        if cancel.is_set():
+                        try:
+                            if not request.queue_wait():
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                        except (QueueCancelled, QueueWaitExpired):
                             self.fifo.release()
-                            raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
-                            raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            raise
                         turn.callback(self.fifo.release)
-                    else:
+                    elif request.heartbeat():
                         yield "ping", None
             with turn:
                 try:
-                    with self.status_lock:
-                        if trace is not None:
-                            trace["queue_s"] += round(time.perf_counter() - waiting, 3)
-                            trace["state"] = "generating"
-                        if not par:
-                            self.status["queued"] -= 1
-                            queued_counted = False
-                            self.terminal_requests[request_id].update(state="admitted", admitted_at=time.time())
-                            self._terminal_event_locked(request_id, "admitted")
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
@@ -6414,15 +6413,10 @@ class Service:
                     if not par:
                         self.ensure_loaded()
                     elif not (self.loaded() and not self._vision_down()):
-                        with self._inference_fifo(deadline, cancel):
+                        with self._inference_fifo(request):
                             self.ensure_loaded()
                     with self.status_lock:
-                        if par:
-                            self.status["queued"] -= 1
-                            queued_counted = False
-                            self.terminal_requests[request_id].update(state="waiting", admitted_at=time.time())
-                            self._terminal_event_locked(request_id, "admitted")
-                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                        st.update(busy=True, phase="waiting", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
@@ -6769,6 +6763,8 @@ class Service:
             finish = "error"
             raise
         finally:
+            request.finished()
+            request.changed = None
             with self.status_lock:
                 if queued_counted:
                     self.status["queued"] -= 1

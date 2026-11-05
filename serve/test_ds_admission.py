@@ -107,8 +107,8 @@ class Admission(unittest.TestCase):
     def wait_for_waiters(self, count):
         deadline = time.monotonic() + 10
         while True:
-            with self.engine.multi_admission.cv:
-                if len(self.engine.multi_admission.waiting) == count:
+            with self.engine.admission.cv:
+                if len(self.engine.admission.waiting) == count:
                     return
             self.assertLess(time.monotonic(), deadline, 'requests did not enter the admission queue')
             time.sleep(0.01)
@@ -290,6 +290,31 @@ class Admission(unittest.TestCase):
         self.wait_for_waiters(0)
         self.assertFalse((self.root / 'sent-67').exists())
         self.assertTrue(self.engine.alive())
+
+    def test_service_keeps_a_waiter_queued_until_native_submission(self):
+        self.fill()
+        service = server.Service(self.engine, server.ByteTokenizer(),
+                                 server.ChatTemplate(Path(server.__file__).with_name('chat_template.jinja')))
+        cancel = threading.Event()
+        self.cancels.append(cancel)
+        future = self.pool.submit(lambda: list(service.run([67], False, None, 1000, {}, cancel)))
+        self.wait_for_waiters(1)
+        with service.status_lock:
+            self.assertEqual(service.status['queued'], 1)
+            row = next(iter(service.terminal_requests.values()))
+            self.assertEqual(row['state'], 'waiting')
+            self.assertIsNone(row['admitted_at'])
+        self.assertIsNone(cancel._strata_lifecycle.heard)
+        self.touch('release-65')
+        self.wait_for('started-67')
+        with service.status_lock:
+            self.assertEqual(service.status['queued'], 0)
+            row = next(iter(service.terminal_requests.values()))
+            self.assertEqual(row['state'], 'reading')
+            self.assertIsNotNone(row['admitted_at'])
+        self.touch('release-67')
+        future.result(timeout=5)
+        self.assertEqual(service.status['queued'], 0)
 
 
 if __name__ == '__main__':
