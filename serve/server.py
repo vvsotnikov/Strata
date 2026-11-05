@@ -1382,6 +1382,9 @@ class StrataEngine:
             self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
         self.rid_q: dict[int, queue.Queue] = {}         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
         self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
+        # DeepSeek's native waiting queue emits no progress. Keep excess requests here, before GEN and its
+        # execution watchdog. Each process owns its gate; old waiters must not enter a restarted engine.
+        self.multi_admission = (self.proc, threading.BoundedSemaphore(self.multi)) if self.multi else None
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -2722,6 +2725,32 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+        if not self.multi:
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
+            return
+        proc, gate = self.multi_admission
+        beat = time.monotonic()
+        while True:
+            if cancel.is_set():
+                return
+            if self.proc is not proc or not self.alive():
+                raise EngineDied("the engine stopped while this request was waiting for a conversation")
+            if gate.acquire(timeout=0.1):
+                break
+            if time.monotonic() - beat >= 10.0:
+                beat = time.monotonic()
+                yield None
+        try:
+            if cancel.is_set():
+                return
+            if self.proc is not proc or not self.alive():
+                raise EngineDied("the engine stopped while this request was waiting for a conversation")
+            # Keep the permit through STOP/DONE cleanup: the native conversation is still occupied until then.
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
+        finally:
+            gate.release()
+
+    def _generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
