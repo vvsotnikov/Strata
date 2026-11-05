@@ -6350,11 +6350,12 @@ class Service:
                                                     "prompt_tokens": len(ids)}
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
+        traced_queue_s = 0.0
         request = RequestLifecycle(cancel, heartbeat_s=QUEUE_BEAT_S)
         cancel._strata_lifecycle = request
 
         def state_changed(phase):
-            nonlocal queued_counted
+            nonlocal queued_counted, traced_queue_s
             if phase not in ("queued", "executing"):
                 return
             with self.status_lock:
@@ -6377,7 +6378,8 @@ class Service:
                     self._terminal_event_locked(request_id, "admitted")
                     self._terminal_event_locked(request_id, "reading")
                     if trace is not None:
-                        trace["queue_s"] = round(request.queue_s, 3)
+                        trace["queue_s"] += round(request.queue_s - traced_queue_s, 3)
+                        traced_queue_s = request.queue_s
                         trace["state"] = "generating"
         request.changed = state_changed
         try:
