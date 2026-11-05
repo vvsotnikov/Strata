@@ -78,7 +78,7 @@ class Admission(unittest.TestCase):
         )
         self.patcher.start()
         self.engine = server.StrataEngine('strata', ['--parallel', '2', '--control', str(self.root)])
-        self.engine.silence_s = 0.3
+        self.engine.silence_s = 2.0
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.cancels = []
 
@@ -98,14 +98,25 @@ class Admission(unittest.TestCase):
         (self.root / name).touch()
 
     def wait_for(self, name):
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 10
         while not (self.root / name).exists():
             self.assertTrue(self.engine.alive(), f'engine died while waiting for {name}')
             self.assertLess(time.monotonic(), deadline, name)
             time.sleep(0.01)
 
-    def request(self, token, stop_after=None):
+    def wait_for_waiters(self, count):
+        deadline = time.monotonic() + 10
+        while True:
+            with self.engine.multi_admission.cv:
+                if len(self.engine.multi_admission.waiting) == count:
+                    return
+            self.assertLess(time.monotonic(), deadline, 'requests did not enter the admission queue')
+            time.sleep(0.01)
+
+    def request(self, token, stop_after=None, deadline=None):
         cancel = threading.Event()
+        if deadline is not None:
+            cancel._strata_queue_deadline = deadline
         self.cancels.append(cancel)
 
         def run():
@@ -133,7 +144,8 @@ class Admission(unittest.TestCase):
     def test_waiting_longer_than_silence_limit_does_not_kill_active_requests(self):
         a, b = self.fill()
         c, _ = self.request(67)
-        time.sleep(0.8)  # active requests keep producing; the third waits past its 0.32 s allowance
+        self.wait_for_waiters(1)
+        time.sleep(2.5)  # active requests keep producing; the third waits past its 2.02 s allowance
         self.assertTrue(self.engine.alive())
         self.assertFalse(c.done())
         self.assertFalse((self.root / 'sent-67').exists())
@@ -143,7 +155,7 @@ class Admission(unittest.TestCase):
         self.touch('release-66')
         self.touch('release-67')
         for token, future in ((65, a), (66, b), (67, c)):
-            result = future.result(timeout=3)
+            result = future.result(timeout=5)
             self.assertTrue(result)
             self.assertEqual(set(result), {token})
         self.assertTrue(self.engine.alive())
@@ -152,11 +164,17 @@ class Admission(unittest.TestCase):
     def test_cancellation_while_waiting_sends_no_native_request(self):
         self.fill()
         c, cancel = self.request(67)
-        time.sleep(0.1)
+        self.wait_for_waiters(1)
+        d, _ = self.request(68)
+        self.wait_for_waiters(2)
         cancel.set()
-        self.assertEqual(c.result(timeout=1), [])
+        self.assertEqual(c.result(timeout=5), [])
         self.assertFalse((self.root / 'sent-67').exists())
         self.assertTrue(self.engine.alive())
+        self.touch('release-65')
+        self.wait_for('started-68')
+        self.touch('release-68')
+        d.result(timeout=5)
 
     def test_cancelled_active_request_holds_capacity_until_stop_acknowledged(self):
         self.touch('defer-stop-65')
@@ -165,32 +183,32 @@ class Admission(unittest.TestCase):
         self.wait_for('stopped-65')
         self.wait_for('started-66')
         c, _ = self.request(67)
-        time.sleep(0.1)
+        self.wait_for_waiters(1)
         self.assertFalse((self.root / 'sent-67').exists())
         self.assertFalse(a.done())
         (self.root / 'defer-stop-65').unlink()
-        a.result(timeout=1)
+        a.result(timeout=5)
         self.wait_for('started-67')
         self.touch('release-66')
         self.touch('release-67')
-        b.result(timeout=1)
-        c.result(timeout=1)
+        b.result(timeout=5)
+        c.result(timeout=5)
 
     def test_engine_death_releases_waiting_requests(self):
         a, b = self.fill()
         c, _ = self.request(67)
-        time.sleep(0.1)
+        self.wait_for_waiters(1)
         self.engine.proc.kill()  # only this test's fake subprocess
         for future in (a, b, c):
             with self.assertRaises(server.EngineDied):
-                future.result(timeout=2)
+                future.result(timeout=6)
 
     def test_admitted_request_still_has_a_silence_watchdog(self):
         self.touch('freeze-65')
         a, _ = self.request(65)
         self.wait_for('started-65')
         with self.assertRaises(server.EngineSilent):
-            a.result(timeout=2)
+            a.result(timeout=6)
         self.assertFalse(self.engine.alive())
 
     def test_invalid_request_does_not_leak_capacity(self):
@@ -200,24 +218,78 @@ class Admission(unittest.TestCase):
         a, b = self.fill()
         self.touch('release-65')
         self.touch('release-66')
-        a.result(timeout=1)
-        b.result(timeout=1)
+        a.result(timeout=5)
+        b.result(timeout=5)
 
     def test_restart_does_not_admit_an_old_waiter_to_the_new_process(self):
         a, b = self.fill()
         c, _ = self.request(67)
-        time.sleep(0.1)
+        self.wait_for_waiters(1)
         self.engine.proc.kill()
         self.engine.restart()
         for future in (a, b, c):
             with self.assertRaises(server.EngineDied):
-                future.result(timeout=2)
+                future.result(timeout=6)
         self.assertFalse((self.root / 'sent-67').exists())
         self.assertTrue(self.engine.alive())
         d, _ = self.request(68)
         self.wait_for('started-68')
         self.touch('release-68')
-        d.result(timeout=1)
+        d.result(timeout=5)
+
+    def test_restart_between_admission_and_gen_does_not_use_the_replacement(self):
+        send = self.engine._send
+
+        def restart_before_send(text, **kwargs):
+            self.engine.proc.kill()
+            self.engine.restart()
+            return send(text, **kwargs)
+
+        with mock.patch.object(self.engine, '_send', restart_before_send):
+            a, _ = self.request(65)
+            with self.assertRaises(server.EngineDied):
+                a.result(timeout=6)
+        self.assertFalse((self.root / 'sent-65').exists())
+        self.assertTrue(self.engine.alive())
+        b, _ = self.request(66)
+        self.wait_for('started-66')
+        self.touch('release-66')
+        b.result(timeout=5)
+
+    def test_waiters_are_admitted_in_arrival_order(self):
+        a, b = self.fill()
+        c, _ = self.request(67)
+        self.wait_for_waiters(1)
+        d, _ = self.request(68)
+        self.wait_for_waiters(2)
+        self.touch('release-65')
+        self.wait_for('started-67')
+        self.assertFalse((self.root / 'sent-68').exists())
+        self.touch('release-66')
+        self.wait_for('started-68')
+        self.touch('release-67')
+        self.touch('release-68')
+        for future in (a, b, c, d):
+            future.result(timeout=5)
+
+    def test_waiting_request_keeps_the_http_heartbeat_contract(self):
+        self.fill()
+        gen = self.engine.generate([67], 10, {}, threading.Event())
+        with mock.patch.object(server, 'QUEUE_BEAT_S', 0.05):
+            self.assertIsNone(next(gen))
+        gen.close()
+        self.wait_for_waiters(0)
+        self.assertFalse((self.root / 'sent-67').exists())
+        self.assertTrue(self.engine.alive())
+
+    def test_queue_deadline_expires_without_killing_the_engine(self):
+        self.fill()
+        c, _ = self.request(67, deadline=time.monotonic() + 0.1)
+        with self.assertRaises(server.QueueWaitExpired):
+            c.result(timeout=5)
+        self.wait_for_waiters(0)
+        self.assertFalse((self.root / 'sent-67').exists())
+        self.assertTrue(self.engine.alive())
 
 
 if __name__ == '__main__':
