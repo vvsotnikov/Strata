@@ -1099,6 +1099,14 @@ class _RequestOwned:
         self._store(obj)[self.name] = value
 
 
+class _MultiAdmission:
+    def __init__(self, proc, capacity):
+        self.proc, self.capacity = proc, capacity
+        self.cv = threading.Condition()
+        self.waiting = collections.deque()
+        self.active = 0
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1382,6 +1390,9 @@ class StrataEngine:
             self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
         self.rid_q: dict[int, queue.Queue] = {}         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
         self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
+        # DeepSeek's native waiting queue emits no progress. Keep excess requests here, before GEN and its
+        # execution watchdog. Each process owns its gate; old waiters must not enter a restarted engine.
+        self.multi_admission = _MultiAdmission(self.proc, self.multi) if self.multi else None
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -1752,13 +1763,16 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
-    def _send(self, text: str):
+    def _send(self, text: str, proc=None):
         btrace("send>", text[:60])
         try:
             with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+                if proc is not None and self.proc is not proc:
+                    raise EngineDied("the engine restarted before this request was sent")
+                target = proc if proc is not None else self.proc
+                target.stdin.write(text + "\n")
+                target.stdin.flush()
+        except (OSError, AttributeError, ValueError):    # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _send_for(self, born: int, text: str):
@@ -2722,6 +2736,51 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+        """Yield tokens and keepalives; DeepSeek waits FIFO for capacity before its execution watchdog starts."""
+        if not self.multi:
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
+            return
+        admission = self.multi_admission
+        ticket = object()
+        claimed = False
+        beat = time.monotonic()
+        deadline = getattr(cancel, "_strata_queue_deadline", None)
+        with admission.cv:
+            admission.waiting.append(ticket)
+        try:
+            while True:
+                with admission.cv:
+                    if cancel.is_set():
+                        return
+                    if self.proc is not admission.proc or not self.alive():
+                        raise EngineDied("the engine stopped while this request was waiting for a conversation")
+                    left = deadline - time.monotonic() if deadline is not None else 0.5
+                    if left <= 0:
+                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    if admission.waiting[0] is ticket and admission.active < admission.capacity:
+                        admission.waiting.popleft()
+                        admission.active += 1
+                        claimed = True
+                        admission.cv.notify_all()
+                        break
+                    admission.cv.wait(timeout=min(0.5, left))
+                if time.monotonic() - beat >= QUEUE_BEAT_S:
+                    beat = time.monotonic()
+                    yield None
+            if cancel.is_set():
+                return
+            cancel._strata_queue_deadline = None
+            # Keep the permit through STOP/DONE cleanup: the native conversation is still occupied until then.
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only, _proc=admission.proc)
+        finally:
+            with admission.cv:
+                if claimed:
+                    admission.active -= 1
+                else:
+                    admission.waiting.remove(ticket)
+                admission.cv.notify_all()
+
+    def _generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, _proc=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2760,13 +2819,15 @@ class StrataEngine:
             head = f"GEN 0 prefill=1{rid_key}"
         try:
             if rid is not None:                          # several requests write to the engine at once
-                self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
+                self._send(f"{head} {','.join(str(int(t)) for t in ids)}", proc=_proc)
             else:
                 self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
                 self.proc.stdin.flush()
-        except (OSError, EngineDied):                    # the pipe is gone: the engine died (not the client)
+        except (OSError, EngineDied) as exc:             # the pipe is gone: the engine died (not the client)
             if rid is not None:
                 self.rid_q.pop(rid, None)
+            if isinstance(exc, EngineDied):
+                raise
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
