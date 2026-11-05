@@ -592,9 +592,17 @@ class ParallelService(FakeEngineCase):
         goes to another slot (or waits) and is answered; the same conversation's next turn works too."""
         self.start(2)
         self.engine.SLOT_PARK_S = 0.2
-        out = self._two_at_once("BUSYSLOT hello")
+        while_waiting = []
+        queue_wait = server.RequestLifecycle.queue_wait
+        def queued(request):
+            while_waiting.append(request.phase)
+            return queue_wait(request)
+        with mock.patch.object(server.RequestLifecycle, "queue_wait", queued):
+            out = self._two_at_once("BUSYSLOT hello")
         self.assertEqual(out["b"][0], "ok", out["b"])
         self.assertIn("REFUSED", self.log.read_text())
+        self.assertTrue(while_waiting)
+        self.assertEqual(set(while_waiting), {"queued"}, "refused native admissions must return to the queue")
         again = self.chat("BUSYSLOT hello")                     # the conversation is not poisoned
         self.assertEqual(again["choices"][0]["message"]["content"], "ok, done.")
         time.sleep(0.5)

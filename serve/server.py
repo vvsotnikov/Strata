@@ -2489,6 +2489,7 @@ class StrataEngine:
                         self.slot_held[slot] = []
                         phase = "none"
                         self._ctl_erred = False
+                        lifecycle(cancel).queued()
                         self._park_slot(slot)
                         slot = None
                         continue
