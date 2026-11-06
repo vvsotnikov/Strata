@@ -1381,8 +1381,8 @@ class StrataEngine:
         if "rid_lock" not in self.__dict__:
             self.rid_lock = threading.Condition()
             self.rid_n = 0                              # --parallel requests' ids (rid=): never reused, a restart goes on from here
-        self.rid_q: dict[int, queue.Queue] = {}         # this process's: rid -> that request's lines (T / PP / DONE / ERR, rid taken out)
-        self.rid_proc = self.proc
+        self.rid_q: dict[int, queue.Queue] = {}         # Requests in arrival order; each ID maps to its output queue.
+        self.rid_proc = self.proc                      # Reject waiting requests if this process is replaced.
         self.multi_stat = ""                            # the engine's last STAT line over everything it wrote
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -2727,7 +2727,7 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
-        """Request-ID engines admit the first native-capacity entries of their request registry."""
+        """Generate tokens, waiting for a free engine slot when necessary."""
         if not self.multi:
             yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
             return
@@ -2744,10 +2744,11 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     if requests is not self.rid_q or proc is not self.proc or not self.alive():
-                        raise EngineDied("the engine stopped while this request was waiting for a conversation")
+                        raise EngineDied("the engine stopped or restarted before this request was sent")
                     left = deadline - time.monotonic() if deadline is not None else 0.5
                     if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                        raise QueueWaitExpired("the request timed out waiting for a free engine slot; retry later")
+                    # The engine can run self.multi requests; the rest wait in arrival order.
                     if rid in itertools.islice(requests, self.multi):
                         break
                     self.rid_lock.wait(timeout=min(0.5, left))
@@ -2757,7 +2758,7 @@ class StrataEngine:
             if cancel.is_set():
                 return
             cancel._strata_queue_deadline = None
-            # Keep the permit through STOP/DONE cleanup: the native conversation is still occupied until then.
+            # A cancelled request stays in the map until the engine confirms it has stopped.
             yield from self._generate(ids, max_new, sampling, cancel, embeddings, prefill_only,
                                       _proc=proc, _rid=rid, _lines=lines)
         finally:

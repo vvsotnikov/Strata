@@ -1,7 +1,7 @@
-"""DeepSeek requests waiting for native capacity must not run an execution watchdog.
+"""Requests waiting for a free engine slot must not trigger the engine timeout.
 
 Run with python -m unittest serve.test_ds_admission -v; no GPU or model is used.
-The subprocess implements the native engine's finite-capacity, silent waiting queue.
+A small Python program stands in for an engine that queues extra requests without reporting progress.
 """
 import concurrent.futures
 import sys
