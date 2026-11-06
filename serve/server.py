@@ -1177,7 +1177,7 @@ class StrataEngine:
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
-        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        self.log = open(log, "a", encoding="utf-8") if log else (None if os.environ.get("STRATA_STDERR_LOGS") == "1" else subprocess.DEVNULL)
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
@@ -3345,7 +3345,7 @@ class Vision:
         self._ensure_dir()
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                          stderr=log or (None if os.environ.get("STRATA_STDERR_LOGS") == "1" else subprocess.DEVNULL), text=True, encoding="utf-8", errors="replace", bufsize=1,
                           env=env, cwd=self.dir)
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
@@ -8314,6 +8314,18 @@ def make_handler(svc: Service):
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
                     self._json(code, body)
+                elif path == "/tokenize":
+                    content = req.get("content")
+                    if not isinstance(content, str):
+                        raise ValueError("content must be a string")
+                    for flag in ("add_special", "parse_special"):
+                        if flag in req and not isinstance(req[flag], bool):
+                            raise ValueError(flag + " must be a boolean")
+                    # The pinned tokenizer declares add_bos_token=false: add_special
+                    # never inserts a BOS. parse_special independently recognizes text specials.
+                    self._json(200, {"tokens": svc.tok.encode(content, parse_special=req.get("parse_special", True))})
+                elif path == "/v1/chat/completions/input_tokens":
+                    self._openai_count(req)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
@@ -8619,18 +8631,44 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
-        def _openai(self, req):
+        def _openai_prompt(self, req):
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
             self._no_local_images(messages)
-            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
+            kind, name = tool_choice_of(req.get("tool_choice"))
+            names = [tool.get("name") for tool in tools or []]
+            if kind == "unknown" or (kind == "required" and not names):
+                raise ValueError("tool_choice must name an available function or be auto, none or required")
+            if kind == "named" and names.count(name) != 1:
+                raise ValueError("Named tool_choice must match exactly one supplied function")
+            if kind == "none":
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
+            return req, messages, tools, kw, force, validator
+
+        def _openai_count(self, req):
+            req, messages, tools, kw, force, _ = self._openai_prompt(req)
+            svc.load()
+            svc.reasoning_budget(req)
+            stop_strings(req)
+            check_request_sampling(req)
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            try:
+                # Use generation's actual multimodal processor, schema/tool instructions
+                # and reasoning prefix. A template-only count omits image embeddings.
+                ids, _, _ = svc.prepare(messages, tools, kw, 1, force=force, req=req, cancel=cancel)
+                self._json(200, {"input_tokens": len(ids)})
+            finally:
+                svc.drop_embeddings()
+
+        def _openai(self, req):
+            req, messages, tools, kw, force, validator = self._openai_prompt(req)
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
@@ -9280,8 +9318,13 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            from serve.frontend import effort_kwargs
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise ValueError("reasoning_effort must be a name or integer")
+            # main() calls Service.set_family before reading defaults/settings.
+            # Apply that family's request rules here too, including numeric
+            # DeepSeek efforts; other families keep their own accepted values.
+            effort_kwargs(value)
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
