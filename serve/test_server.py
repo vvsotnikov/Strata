@@ -1680,6 +1680,16 @@ class SamplingKeys(unittest.TestCase):
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
+    def test_deepseek_speculation_tuning_does_not_leak_between_requests(self):
+        self.assertIn("spec=0", self.keys(strata_tune={"spec": False}))
+        self.assertIn("spec=1", self.keys(strata_tune={"spec": True}))
+        self.assertIn("dspark_cum=0.5", self.keys(strata_tune={"dspark_cum": 0.5}))
+        self.assertFalse([x for x in self.keys() if x.startswith(("spec=", "dspark_cum="))])
+        for bad in (True, -0.1, 1.1, float("nan"), float("inf"), "0.5"):
+            self.assertFalse([x for x in self.keys(strata_tune={"dspark_cum": bad}) if x.startswith("dspark_cum=")])
+        for bad in (0, 1, "false", None):
+            self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")])
+
     def test_tune_prefill_pipe(self):
         self.assertIn("pipe=1536.0", self.keys(temperature=0, strata_tune={"prefill_pipe": 1536}))
         self.assertIn("pipe=0.0", self.keys(temperature=0, strata_tune={"prefill_pipe": 0}))

@@ -1688,6 +1688,14 @@ class StrataEngine:
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
+            # DeepSeek's GEN protocol supports these per request: compare drafting
+            # and confidence policies without reloading the resident model.
+            spec = tune.get("spec")
+            if isinstance(spec, bool):
+                keys += f" spec={int(spec)}"
+            cum = tune.get("dspark_cum")
+            if isinstance(cum, (int, float)) and not isinstance(cum, bool) and 0.0 <= float(cum) <= 1.0:
+                keys += f" dspark_cum={float(cum)!r}"
             for k in ("pcie_frac", "spec_min_p"):
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
@@ -9515,7 +9523,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py)
             if not isinstance(value, dict):
                 raise SystemExit(f"[strata] config sampling.strata_tune={value!r}: expected an object")
-            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus")}
+            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus", "spec", "dspark_cum")}
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
