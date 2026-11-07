@@ -504,6 +504,61 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
 
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+// Prefill router: share activation panels across four rows and reuse each weight
+// across NC tokens. Float4 FMA order and warp reduction match the token kernel.
+template <int NC>
+__global__ void __launch_bounds__(128) gemv_f32_tiled_kernel(const float* __restrict__ W,
+        const float* __restrict__ x, int n, int k, int T, float* __restrict__ y, int ldy) {
+    __shared__ float4 panel[NC][32];
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * NC;
+    const int k4 = k / 4;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int base = 0; base < k4; base += 32) {
+        for (int i = threadIdx.x; i < NC * 32; i += 128) {
+            const int c = i / 32, j = base + i % 32;
+            panel[c][i % 32] = t0 + c < T && j < k4
+                ? ((const float4*) (x + (size_t) (t0 + c) * k))[j]
+                : make_float4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (row < n && base + lane < k4) {
+            const float4 a = ((const float4*) (W + (size_t) row * k))[base + lane];
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (t0 + c < T) {
+                    const float4 b = panel[c][lane];
+                    acc[c] = fmaf(a.x, b.x, acc[c]);
+                    acc[c] = fmaf(a.y, b.y, acc[c]);
+                    acc[c] = fmaf(a.z, b.z, acc[c]);
+                    acc[c] = fmaf(a.w, b.w, acc[c]);
+                }
+        }
+        __syncthreads();
+    }
+    if (row < n) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (t0 + c < T) {
+                const float v = warp_sum(acc[c]);
+                if (lane == 0) y[(size_t) (t0 + c) * ldy + row] = v;
+            }
+    }
+}
+
+int router_tile() {
+    static const int tile = [] {
+        const char* v = std::getenv("STRATA_DS4_ROUTER_TILE");
+        return v == nullptr ? 0 : std::strcmp(v, "8") == 0 ? 8 :
+            std::strcmp(v, "16") == 0 ? 16 : std::strcmp(v, "32") == 0 ? 32 : 0;
+    }();
+    return tile;
+}
+#endif
+
 // ---------------------------------------------------------------- the router
 // A pick that never came out: every score left is NaN (the gate's input went non-finite), so nothing beat -FLT_MAX and the
 // index is still the 0x7fffffff it started as - and the next line read sc[0x7fffffff] (shared memory), then vram[0x7fffffff] /
@@ -2370,6 +2425,14 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
 #if defined(STRATA_METAL)
     if (T > 0 && ::strata::dsv41::metal_host::gemv_f32(W, x, n, k, T, y, ldy)) return;
+#endif
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    if (T >= 128 && n > 0 && k > 0 && k % 4 == 0) {
+        const int tile = router_tile();
+        if (tile == 8) { strata_ds4_launch(gemv_f32_tiled_kernel<8>, dim3(cdiv(n, 4), cdiv(T, 8)), 128, 0, s, W, x, n, k, T, y, ldy); return; }
+        if (tile == 16) { strata_ds4_launch(gemv_f32_tiled_kernel<16>, dim3(cdiv(n, 4), cdiv(T, 16)), 128, 0, s, W, x, n, k, T, y, ldy); return; }
+        if (tile == 32) { strata_ds4_launch(gemv_f32_tiled_kernel<32>, dim3(cdiv(n, 4), cdiv(T, 32)), 128, 0, s, W, x, n, k, T, y, ldy); return; }
+    }
 #endif
     if (T > 0) strata_ds4_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
 }
