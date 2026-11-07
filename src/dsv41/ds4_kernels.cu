@@ -552,8 +552,12 @@ __global__ void __launch_bounds__(128) gemv_f32_tiled_kernel(const float* __rest
 int router_tile() {
     static const int tile = [] {
         const char* v = std::getenv("STRATA_DS4_ROUTER_TILE");
-        return v == nullptr ? 0 : std::strcmp(v, "8") == 0 ? 8 :
+        const int selected = v == nullptr ? 0 : std::strcmp(v, "8") == 0 ? 8 :
             std::strcmp(v, "16") == 0 ? 16 : std::strcmp(v, "32") == 0 ? 32 : 0;
+        if (selected == 0 && v != nullptr && std::strcmp(v, "0") != 0)
+            std::fprintf(stderr, "ds4: invalid STRATA_DS4_ROUTER_TILE='%s'; using original router\n", v);
+        std::fprintf(stderr, "ds4: FP32 prefill router tile=%d (T>=128)\n", selected);
+        return selected;
     }();
     return tile;
 }
