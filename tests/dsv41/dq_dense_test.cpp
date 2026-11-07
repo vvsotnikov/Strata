@@ -517,9 +517,9 @@ void run_repeat(const TypeInfo& ty, const Kern& kn, bool quick) {
 // ------------------------------------------------------------------------------------------------ mv: iq::mv
 void run_mv(const TypeInfo& ty, bool quick) {
     if (!iq::supported(ty.id) || ty.id == iq::kIQ4_NL) return;
-    const int ks[] = {256, 1024, 4096, 5120, 8192};
+    const int ks[] = {256, 1024, 4096, 5120, 8192, 16384};
     const int ns[] = {1, 5, 8, 9, 64, 129};
-    const int ncs[] = {1, 2, 4, 5, 8, 16};
+    const int ncs[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     Tally& t = g_res[key("mv", ty.name, "-")];
     std::mt19937_64 xr(77);
     std::normal_distribution<float> nd(0.f, 1.f);

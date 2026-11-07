@@ -938,6 +938,134 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+// CUDA Q5_K decode/verification path, opt-in with STRATA_DS4_Q5_MV_OPT=1.
+// One warp per output row. Multi-column calls share each activation half-sum
+// across the block rather than recomputing it for every row; the separate
+// half sums and explicit roundings preserve sub_dot<kQ5_K> output bits.
+// Tuned on two RTX A6000s; HIP/Metal and the default path remain unchanged.
+template <int NW, int NC>
+__global__ void __launch_bounds__(NW * 32) q5k_mv_kernel(const Jobs J) {
+    static_assert(Ty<kQ5_K>::TAB == 0, "Q5_K has no shared codebook");
+    const uint32_t* tab = nullptr;
+    const MvJob& b = J.j[blockIdx.y];
+    const int row = blockIdx.x * NW + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<kQ5_K>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<kQ5_K>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
+template <int NW, int NC>
+__global__ void __launch_bounds__(NW * 32) q5k_sum_mv_kernel(const Jobs J) {
+    static_assert(Ty<kQ5_K>::TAB == 0, "Q5_K has no shared codebook");
+    const uint32_t* tab = nullptr;
+    extern __shared__ int2 sums[];
+    const MvJob& b = J.j[blockIdx.y];
+    const int row = blockIdx.x * NW + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int blocks = b.k / 32;
+    for (int i = threadIdx.x; i < blocks * b.ncol; i += NW * 32) {
+        const int c = i / blocks, kb = i % blocks;
+        const int4* x = (const int4*)(b.xq + (size_t)c * b.k + (size_t)kb * 32);
+        const int4 lo = x[0], hi = x[1];
+        int a = __dp4a(0x01010101, lo.x, 0);
+        a = __dp4a(0x01010101, lo.y, a);
+        a = __dp4a(0x01010101, lo.z, a);
+        a = __dp4a(0x01010101, lo.w, a);
+        int d = __dp4a(0x01010101, hi.x, 0);
+        d = __dp4a(0x01010101, hi.y, d);
+        d = __dp4a(0x01010101, hi.z, d);
+        d = __dp4a(0x01010101, hi.w, d);
+        sums[i] = make_int2(a, d);
+    }
+    __syncthreads();
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<kQ5_K>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                const int4 xa = xp[0], xb = xp[1];
+                int lo = __dp4a(s.q[0], xa.x, 0);
+                lo = __dp4a(s.q[1], xa.y, lo);
+                lo = __dp4a(s.q[2], xa.z, lo);
+                lo = __dp4a(s.q[3], xa.w, lo);
+                int hi = __dp4a(s.q[4], xb.x, 0);
+                hi = __dp4a(s.q[5], xb.y, hi);
+                hi = __dp4a(s.q[6], xb.z, hi);
+                hi = __dp4a(s.q[7], xb.w, hi);
+                const int2 sum = sums[c * nsb + kb];
+                float v = __fmul_rn(s.d, (float)(s.s0 * lo + s.s1 * hi));
+                v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float)sum.x), __fmul_rn(s.m1, (float)sum.y)));
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], v, acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
+
+bool q5_mv_optimized() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DS4_Q5_MV_OPT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+template <int NW>
+void q5_mv(const Jobs& j, int nj, int n, int columns, cudaStream_t s) {
+    const dim3 grid((unsigned)((n + NW - 1) / NW), (unsigned)nj);
+    int max_k = 0;
+    for (int i = 0; i < nj; ++i) max_k = std::max(max_k, j.j[i].k);
+    const size_t shared = (size_t)(max_k / 32) * columns * sizeof(int2);
+    if (columns >= 2 && shared <= 48 * 1024) {
+        if (columns == 2) strata_ds4_launch(q5k_sum_mv_kernel<NW, 2>, grid, NW * 32, shared, s, j);
+        else if (columns == 3) strata_ds4_launch(q5k_sum_mv_kernel<NW, 3>, grid, NW * 32, shared, s, j);
+        else if (columns == 4) strata_ds4_launch(q5k_sum_mv_kernel<NW, 4>, grid, NW * 32, shared, s, j);
+        else if (columns == 5) strata_ds4_launch(q5k_sum_mv_kernel<NW, 5>, grid, NW * 32, shared, s, j);
+        else if (columns <= 8) strata_ds4_launch(q5k_sum_mv_kernel<NW, 8>, grid, NW * 32, shared, s, j);
+        else strata_ds4_launch(q5k_sum_mv_kernel<NW, 16>, grid, NW * 32, shared, s, j);
+        return;
+    }
+    if (columns == 1) strata_ds4_launch(q5k_mv_kernel<NW, 1>, grid, NW * 32, 0, s, j);
+    else if (columns == 2) strata_ds4_launch(q5k_mv_kernel<NW, 2>, grid, NW * 32, 0, s, j);
+    else if (columns == 3) strata_ds4_launch(q5k_mv_kernel<NW, 3>, grid, NW * 32, 0, s, j);
+    else if (columns == 4) strata_ds4_launch(q5k_mv_kernel<NW, 4>, grid, NW * 32, 0, s, j);
+    else if (columns == 5) strata_ds4_launch(q5k_mv_kernel<NW, 5>, grid, NW * 32, 0, s, j);
+    else if (columns <= 8) strata_ds4_launch(q5k_mv_kernel<NW, 8>, grid, NW * 32, 0, s, j);
+    else strata_ds4_launch(q5k_mv_kernel<NW, 16>, grid, NW * 32, 0, s, j);
+}
+#endif
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1276,6 +1404,16 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    if constexpr (T == kQ5_K) {
+        if (q5_mv_optimized()) {
+            if (max_c == 1) q5_mv<4>(J, nj, max_n, max_c, s);
+            else if (max_c <= 8) q5_mv<8>(J, nj, max_n, max_c, s);
+            else q5_mv<16>(J, nj, max_n, max_c, s);
+            return;
+        }
+    }
+#endif
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
 #if defined(STRATA_USE_HIP)
     // gfx12 (HIP), Q2_K: the 1-column and the 4/16-column instantiations of this GEMV round a column one ulp apart on some outputs
