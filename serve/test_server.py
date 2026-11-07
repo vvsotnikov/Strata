@@ -1685,8 +1685,10 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("spec=1", self.keys(strata_tune={"spec": True}))
         self.assertIn("dspark_cum=0.5", self.keys(strata_tune={"dspark_cum": 0.5}))
         self.assertFalse([x for x in self.keys() if x.startswith(("spec=", "dspark_cum="))])
-        for bad in (True, -0.1, 1.1, float("nan"), float("inf"), "0.5"):
+        for bad in (True, -0.1, 1.1, 10**400, -(10**400), float("nan"), float("inf"), "0.5"):
             self.assertFalse([x for x in self.keys(strata_tune={"dspark_cum": bad}) if x.startswith("dspark_cum=")])
+        for key in ("pcie_frac", "spec_min_p", "prefill_pipe"):
+            self.assertFalse([x for x in self.keys(strata_tune={key: 10**400}) if x.startswith(key + "=")])
         for bad in (0, 1, "false", None):
             self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")])
 
