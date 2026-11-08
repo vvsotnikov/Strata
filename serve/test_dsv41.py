@@ -421,6 +421,30 @@ class Api(ApiBase):
         self.assertEqual(self.engine.last_sampling.get("temperature"), 1.0)
 
     # -- effort ------------------------------------------------------------------------------------
+    def published_reasoning(self):
+        with urllib.request.urlopen(self.base + "/v1/models", timeout=30) as r:
+            return json.loads(r.read().decode())["data"][0]["reasoning"]
+
+    def test_the_published_levels_are_the_accepted_ones(self):
+        self.start("ok")
+        reasoning = self.published_reasoning()
+        self.assertEqual(reasoning["supported_efforts"], ["max", "high", "medium", "low", "none"])
+        self.assertIs(reasoning["mandatory"], False)
+        self.assertNotIn("default_effort", reasoning)     # no default is set in this server's config
+        for level in reasoning["supported_efforts"]:
+            status, r = self.chat(reasoning_effort=level)
+            self.assertEqual(status, 200, (level, r))
+
+    def test_the_published_default_is_the_servers_default(self):
+        self.start("ok")
+        self.svc.config_effort = "max"
+        self.assertEqual(self.published_reasoning()["default_effort"], "max")
+
+    def test_another_family_publishes_its_own_levels(self):
+        self.addCleanup(frontend.use_family, None)
+        frontend.use_family(None)
+        self.assertEqual(frontend.reasoning_capabilities(None)["supported_efforts"], ["xhigh", "medium", "low", "none"])
+
     def test_effort_words(self):
         self.start("ok")
         for given, line in (("low", "Reasoning Effort: 50 "), ("medium", "Reasoning Effort: 62 "),

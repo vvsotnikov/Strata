@@ -169,6 +169,18 @@ def effort_kwargs(value) -> dict:
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
+def reasoning_capabilities(default) -> dict:
+    """What /v1/models publishes about thinking levels, in OpenRouter's shape: the names effort_kwargs accepts for
+    this family, highest first (spellings that map onto another level are left out), and the default if one is set."""
+    levels = [name for name, level in reversed(EFFORT.items()) if name == level]
+    if None in EFFORT.values():
+        levels.append("none")
+    capabilities = {"supported_efforts": levels, "mandatory": "none" not in levels}
+    if default is not None:
+        capabilities["default_effort"] = default
+    return capabilities
+
+
 def budget_effort(tokens) -> dict:
     """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
     try:
