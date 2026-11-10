@@ -74,6 +74,7 @@ struct Options {
     // --parallel: conversations held at once (1-8), each its own state - its position, tokens, checkpoints, window rings,
     // the compressors' partial groups, the compressed KV and the index keys (a full context's each); 1: as before
     int seqs = 1;
+    bool check_tp_only = false;   // --check-tp: actual packed/DMA/expert parity, then exit without loading the model
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]

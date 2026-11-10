@@ -119,6 +119,7 @@ void usage() {
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
                  "           [--vision on|off] [--vision-resident (--serve: keep the picture tower on the card; default: in RAM between pictures)] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           | --check-tp (verify actual tensor-parallel weights and GPU expert outputs, then exit)\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n");
 }
@@ -2545,6 +2546,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--dspark-block") o.dspark_block = std::max(0, std::atoi(val("--dspark-block").c_str()));
         else if (a == "--dspark-depth") g_spec_depth = std::max(1, std::atoi(val("--dspark-depth").c_str()));
+        else if (a == "--check-tp") o.check_tp_only = true;
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
@@ -2610,7 +2612,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    if (o.pack.empty() || (!o.check_tp_only && !serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
         return 2;
     }
@@ -2624,6 +2626,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
         return 1;
     }
+    if (o.check_tp_only) return 0;
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
