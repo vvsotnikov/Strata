@@ -135,6 +135,9 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   A server with several tenants names each request's tenant (`GEN ... scope=<id>`): the engine reuses only what a
   request of the same scope read, so a tenant's token counts and speed say nothing about another tenant's prompts.
   Conversations kept by a build without scopes are removed at start.
+  `STRATA_DS4_PICTURE_KEEP` (8) is how many pictures' encodings are kept. After each request the engine writes a `CACHE` line
+  (entries and bytes in RAM and in the folder, the caps, shared starts, pictures, scopes, and what was given up for room); the
+  server shows it under `conversation_cache.kept` in `/metrics`.
 
 Pictures are on by default: the engine reads them with its own vision tower (no separate picture reader). The tower waits in RAM (about 1 GB of pinned
 memory) and takes its 319 MiB of graphics memory only while a picture is being read, out of the room `--reserve-mib` keeps free; the experts get that room

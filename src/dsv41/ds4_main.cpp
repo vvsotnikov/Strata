@@ -62,6 +62,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
 #include <io.h>
@@ -446,8 +447,14 @@ bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
 }
 
 // the encoded spans, the latest few (a conversation sends its pictures with every turn), each the scope's that
-// encoded it: the same picture from another scope is encoded again
+// encoded it: the same picture from another scope is encoded again.  STRATA_DS4_PICTURE_KEEP (8): how many are kept,
+// the least recently used giving way (a server with many tenants: a few a tenant)
 struct SpanCache {
+    size_t keep = [] {
+        const char* v = std::getenv("STRATA_DS4_PICTURE_KEEP");
+        const long n = v != nullptr ? std::atol(v) : 0;
+        return n > 0 ? (size_t) n : (size_t) 8;
+    }();
     struct Key {
         std::string scope;
         uint64_t hash;
@@ -465,7 +472,7 @@ struct SpanCache {
         auto rows = std::make_shared<std::vector<uint16_t>>();
         if (!m.encode_image(p.rgb.data(), p.width, p.height, *rows, err)) return nullptr;
         q.emplace_front(Key{scope, p.hash}, rows);
-        if (q.size() > 8) q.pop_back();
+        while (q.size() > keep) q.pop_back();
         return rows;
     }
 };
@@ -637,19 +644,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         ram = disk = 0;
         for (const Slot& s : slots) (s.data ? ram : disk) += 1;
     };
-    // the folder's conversations (their .bin; a .meta beside each is a few KB: identity and tokens)
+    // the folder's conversations (their .bin; a .meta beside each is a few KB: identity and tokens).  From the slots
+    // themselves: the start left nothing else in the folder, and a scan of it at every write cost 10 us a file -
+    // 0.1 s a request with 10,000 kept
     const auto slot_folder_bytes = [&]() {
         uint64_t total = 0;
-        std::error_code ec;
-        for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {
-            const std::string fn = de.path().filename().string();
-            if (fn.rfind("slot-", 0) == 0 && fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0) {
-                const uint64_t bytes = (uint64_t) std::filesystem::file_size(de.path(), ec);
-                if (!ec) total += bytes;
-            }
-        }
+        for (const Slot& s : slots)
+            if (!s.data) total += s.bytes;
         return total;
     };
+    // what the caches hold, for the server's metrics: a CACHE line on stdout after each request's reuse was settled
+    uint64_t n_saved = 0, n_taken = 0, n_evicted = 0, evicted_bytes = 0;
     // the folder over STRATA_DS4_SLOT_GB: its least recently used conversation goes first, and never `keep` (the one just
     // written), so a conversation bigger than the cap stays
     const auto slot_trim = [&](const std::string& keep) {
@@ -661,6 +666,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (!slots[i].data && slots[i].path != keep && (lru == SIZE_MAX || slots[i].used < slots[lru].used))
                     lru = i;
             if (lru == SIZE_MAX) break;
+            ++n_evicted;
+            evicted_bytes += slots[lru].bytes;
             slot_drop(lru);
             ++dropped;
         }
@@ -738,8 +745,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (size_t i = 0; i < slots.size(); ++i)
                 if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
             if (lru == SIZE_MAX) break;
-            if (!slot_write_file(slots[lru])) slot_drop(lru);
+            if (!slot_write_file(slots[lru])) {   // (not written: the conversation is lost)
+                ++n_evicted;
+                evicted_bytes += slots[lru].bytes;
+                slot_drop(lru);
+            }
         }
+        ++n_saved;
         int ram = 0, disk = 0;
         slot_count(ram, disk);
         char msg[256];
@@ -796,6 +808,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return 0;
         }
         whole = len == whole_len;
+        ++n_taken;
         slots[best].used = ++slot_clock;
         if (!ram) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
@@ -878,6 +891,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (size_t i = 1; i < prefixes.size(); ++i)
                 if (prefixes[i].used < prefixes[lru].used) lru = i;
             total -= prefixes[lru].data.size();
+            ++n_evicted;
+            evicted_bytes += prefixes[lru].data.size();
             prefixes.erase(prefixes.begin() + (long) lru);
         }
         std::fprintf(stderr, "ds4: kept a %zu-token shared start (%s in RAM in %.2f s); %zu kept, %s\n", t.size(),
@@ -900,6 +915,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::fprintf(stderr, "ds4: took back a %zu-token shared start (%.2f s)\n", p.tokens.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return true;
+    };
+    // CACHE: the kept state in numbers (entries and bytes in RAM and in the folder, the folder's cap, the shared
+    // starts and theirs, pictures, the scopes that own any of it, and since the start: conversations set aside and
+    // taken back, entries given up for room and their bytes)
+    const auto cache_line = [&]() {
+        int ram = 0, disk = 0;
+        slot_count(ram, disk);
+        uint64_t ram_bytes = 0, start_bytes = 0;
+        std::unordered_set<std::string> owners;
+        for (const Slot& s : slots) {
+            if (s.data) ram_bytes += s.bytes;
+            owners.insert(s.scope);
+        }
+        for (const Prefix& p : prefixes) {
+            start_bytes += p.data.size();
+            owners.insert(p.scope);
+        }
+        std::printf("CACHE ram=%d ram_bytes=%llu ram_cap=%d folder=%d folder_bytes=%llu folder_cap_bytes=%llu starts=%zu "
+                    "start_bytes=%llu starts_cap=%d start_cap_bytes=%llu pictures=%zu pictures_cap=%zu scopes=%zu saved=%llu "
+                    "taken=%llu evicted=%llu evicted_bytes=%llu\n",
+                    ram, (unsigned long long) ram_bytes, slot_max, disk, (unsigned long long) slot_folder_bytes(),
+                    (unsigned long long) (slot_max > 0 ? slot_budget : 0), prefixes.size(), (unsigned long long) start_bytes,
+                    prefix_max, (unsigned long long) prefix_budget, spans.q.size(), spans.keep, owners.size(),
+                    (unsigned long long) n_saved, (unsigned long long) n_taken, (unsigned long long) n_evicted,
+                    (unsigned long long) evicted_bytes);
+        std::fflush(stdout);
     };
     if (slot_max > 0) {
         slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
@@ -964,6 +1005,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             slot_trim("");   // (the folder over STRATA_DS4_SLOT_GB: the least recently used conversation goes first)
         }
     }
+    cache_line();   // (what a previous run left in the folder, before the first request)
     if (slot_max > 0) {
 #if !defined(_WIN32)
         // (the server ends the engine with QUIT and waits for it; a SIGTERM to the whole process group - systemd
@@ -1128,6 +1170,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             else m.reset();
         }
         state_scope() = r.scope;   // (from here the state is this request's: its own scope's, taken back, or empty)
+        cache_line();
         if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),

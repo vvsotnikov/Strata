@@ -43,6 +43,7 @@ class Engine:
         threading.Thread(target=lambda: [self.q.put(line.rstrip("\n")) for line in self.p.stdout] + [self.q.put(None)],
                          daemon=True).start()
         self.notes = []                                  # NOTE lines so far (the folder's come after READY)
+        self.cache = {}                                  # the last CACHE line: what the engine keeps, in numbers
         while True:
             line = self.q.get(timeout=30)
             if line is None:
@@ -73,6 +74,8 @@ class Engine:
             f = line.split()
             if f[0] == "NOTE":
                 self.notes.append(line)
+            if f[0] == "CACHE":
+                self.cache = {k: int(v) for k, v in (item.split("=") for item in f[1:])}
             if f[0] == "ERR" and "expected: GEN" in line:    # a line the engine did not take as a request
                 return "ERR", line
             if f[0] == "DONE":
@@ -223,6 +226,48 @@ class Scopes(unittest.TestCase):
         self.assertEqual(ask(34, "bbbb"), 2)             # another scope's request encodes it itself
         self.assertEqual(ask(36, "bbbb"), 2)
         self.assertEqual(ask(38, None), 3)
+
+
+    def test_the_folder_s_cap_gives_up_the_least_recently_used_and_the_cache_line_counts_it(self):
+        # (a 2000-token conversation of the fake model is 8 KB: the folder holds two, RAM one)
+        e = self.engine({"STRATA_DS4_SLOT_CAP": "1", "STRATA_DS4_SLOT_GB": str(20000 / 2**30)})
+        kept = [prompt(70 + i, 2000) for i in range(10)]
+        for i, p in enumerate(kept):
+            self.assertEqual(e.gen(p, "aaaa" if i % 2 else "bbbb"), 0)
+        self.assertEqual(e.gen(prompt(80, 2000), "cccc"), 0)     # (the last leaves the model: every one is set aside)
+        c = e.cache
+        self.assertEqual((c["ram_cap"], c["folder_cap_bytes"]), (1, 20000))
+        self.assertLessEqual(c["folder_bytes"], c["folder_cap_bytes"])
+        self.assertGreaterEqual(c["saved"], 3)                   # (--parallel keeps four in the model)
+        self.assertGreater(c["evicted"], 0)
+        self.assertGreater(c["evicted_bytes"], 0)
+        self.assertEqual(c["folder"] * 2, len(os.listdir(os.path.join(self.dir, "slots"))))
+        if not self.parallel:
+            self.assertEqual((c["ram"], c["folder"], c["saved"], c["evicted"]), (1, 2, 10, 7))
+            self.assertEqual(c["scopes"], 2)
+            # the ones given up are the least recently used, whoever owns them; the latest comes back
+            self.assertGreaterEqual(e.gen(kept[9] + prompt(81, 50), "aaaa"), 1999)
+            self.assertEqual(e.cache["taken"], 1)
+            self.assertEqual(e.gen(kept[0] + prompt(81, 50), "bbbb"), 0)
+            self.assertEqual(e.gen(kept[3] + prompt(81, 50), "aaaa"), 0)
+
+    def test_the_number_of_kept_pictures_is_a_setting(self):
+        for keep, encodes in ((None, 2), ("1", 3)):
+            with self.subTest(keep=keep):
+                log = os.path.join(self.dir, f"encodes-{keep}.log")
+                e = self.engine({"DS4_FAKE_ENCODE_LOG": log, **({"STRATA_DS4_PICTURE_KEEP": keep} if keep else {})})
+                files = []
+                for n, side in enumerate((2, 4)):
+                    files.append(os.path.join(self.dir, f"picture-{keep}-{n}.dsi"))
+                    with open(files[-1], "wb") as f:
+                        f.write(b"DSI1" + struct.pack("<i", 1) + struct.pack("<qii", 5, side, side) + bytes(side * side * 3))
+                for seed, picture in ((90, files[0]), (92, files[1]), (94, files[0])):
+                    ids = prompt(seed, 5) + [IMAGE_TOKEN] * SPAN + prompt(seed + 1, 40)
+                    self.assertEqual(e.gen(ids, "aaaa", pictures=picture), 0)
+                with open(log) as f:
+                    self.assertEqual(len(f.readlines()), encodes)
+                self.assertEqual(e.cache["pictures_cap"], int(keep or 8))
+                e.quit()
 
 
 class ParallelScopes(Scopes):
