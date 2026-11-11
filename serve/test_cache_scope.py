@@ -8,6 +8,7 @@ prompt encoder reuses only a scope's own prompts, and a value that cannot be a s
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import unittest
@@ -20,7 +21,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import serve.frontend as frontend  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CACHE_SCOPE_KEY, CACHE_SCOPE_MAX, ByteTokenizer, MockEngine, Service, StrataEngine,  # noqa: E402
-                          cache_scope, serve)
+                          cache_scope, conversation_cache_view, parse_cache_line, prompt_keep_setting, serve)
 from strata_tokenizer import PromptEncoder  # noqa: E402
 
 BAD = (5, 1.5, True, False, "", [], ["a"], {"id": "a"}, "x" * (CACHE_SCOPE_MAX + 1))
@@ -96,6 +97,55 @@ class Encoder(unittest.TestCase):
         self.assertEqual(enc.last_reused, 0)
         enc.encode(self.TEXT + " more", store=False, scope="one")
         self.assertGreater(enc.last_reused, 0)
+
+
+class Kept(unittest.TestCase):
+    """What the engine keeps, as /metrics shows it: its CACHE line, and the card on because of it."""
+    LINE = ("CACHE ram=3 ram_bytes=300 ram_cap=16 folder=40 folder_bytes=9000 folder_cap_bytes=10000 starts=2 "
+            "start_bytes=50 starts_cap=4096 start_cap_bytes=700 pictures=1 pictures_cap=256 scopes=7 saved=90 taken=12 "
+            "evicted=5 evicted_bytes=1234\n")
+
+    def test_the_line_is_read_as_numbers(self):
+        kept = parse_cache_line(self.LINE)
+        self.assertEqual(kept["folder_bytes"], 9000)
+        self.assertEqual((kept["ram"], kept["folder"], kept["scopes"], kept["evicted"], kept["evicted_bytes"]),
+                         (3, 40, 7, 5, 1234))
+        self.assertEqual(len(kept), 17)
+        for other in ("STAT tok_s=1.0", "CACHED ram=1", "CACHE", "CACHE ram=x", "NOTE sessions: saved"):
+            self.assertIsNone(parse_cache_line(other), other)
+        self.assertEqual(parse_cache_line("CACHE ram=1 new_key=2 odd=-1 word"), {"ram": 1, "new_key": 2})
+
+    def test_the_card_is_on_when_the_engine_keeps_conversations(self):
+        off = conversation_cache_view({}, [], {}, {})
+        self.assertEqual((off["enabled"], off["kept"]), (False, None))
+        on = conversation_cache_view({}, [], {}, {}, parse_cache_line(self.LINE))
+        self.assertTrue(on["enabled"])
+        self.assertEqual(on["kept"]["folder_cap_bytes"], 10000)
+        self.assertTrue(conversation_cache_view({"conversation_cache_mib": 64}, [], {}, {})["enabled"])
+
+    def test_metrics_carry_the_engine_s_count(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok")
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertFalse(svc.metrics()["conversation_cache"]["enabled"])
+        self.assertNotIn("strata:conversation_cache_bytes", svc.prometheus())
+        engine.cache_stat = parse_cache_line(self.LINE)
+        self.assertEqual(svc.metrics()["conversation_cache"]["kept"]["evicted"], 5)
+        text = svc.prometheus()
+        for row in ("strata:conversation_cache_entries 43", "strata:conversation_cache_bytes 9300",
+                    "strata:conversation_cache_folder_cap_bytes 10000", "strata:conversation_cache_evictions_total 5",
+                    "strata:conversation_cache_scopes 7"):
+            self.assertIn(row + "\n", text)
+
+    def test_the_number_of_kept_prompts_is_a_setting(self):
+        self.assertEqual(prompt_keep_setting({"STRATA_PROMPT_KEEP": "256"}), 256)
+        for bad in ({}, {"STRATA_PROMPT_KEEP": ""}, {"STRATA_PROMPT_KEEP": "0"}, {"STRATA_PROMPT_KEEP": "-4"},
+                    {"STRATA_PROMPT_KEEP": "many"}):
+            self.assertIsNone(prompt_keep_setting(bad), bad)
+        tok = ByteTokenizer()
+        os.environ["STRATA_PROMPT_KEEP"] = "37"
+        self.addCleanup(os.environ.pop, "STRATA_PROMPT_KEEP", None)
+        self.assertEqual(Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja")).prompts.keep, 37)
 
 
 class Recording(MockEngine):

@@ -956,6 +956,15 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+def prompt_keep_setting(env=None) -> int | None:
+    """STRATA_PROMPT_KEEP: how many encoded prompts the server keeps (a whole number above 0), else None."""
+    try:
+        n = int(str((os.environ if env is None else env).get("STRATA_PROMPT_KEEP", "")).strip())
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
     before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
@@ -969,12 +978,30 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
-def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
+def parse_cache_line(line: str) -> dict | None:
+    """The DeepSeek engine's `CACHE k=n ...` line (what its kept conversations, shared starts and pictures hold, in
+    entries and bytes, and what was given up for room since its start) -> {k: n}; None: not such a line."""
+    head, _, rest = line.strip().partition(" ")
+    if head != "CACHE":
+        return None
+    out = {}
+    for item in rest.split():
+        k, eq, v = item.partition("=")
+        if eq and v.isdigit():
+            out[k] = int(v)
+    return out or None
+
+
+def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, kept: dict | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
+    `kept`: the DeepSeek engine's own count (its CACHE line) - it keeps conversations without that option, so the
+    card is on with it, and "kept" carries its entries, bytes, caps and evictions."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
-    return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
+    return {"enabled": (isinstance(mib, int) and mib > 0) or bool(kept),
+            "budget_mib": mib if isinstance(mib, int) else None,
+            "kept": dict(kept) if kept else None,
             "slots": info.get("conversation_cache_slots"), **parked,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
@@ -1189,6 +1216,7 @@ class StrataEngine:
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
+        self.cache_stat = None           # the DeepSeek engine's last CACHE line (parse_cache_line): what it keeps
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
@@ -1440,6 +1468,11 @@ class StrataEngine:
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                continue
+            if line.startswith("CACHE "):               # the DeepSeek engine's kept state in numbers (/metrics)
+                stat = parse_cache_line(line)
+                if stat is not None and self.proc is proc:
+                    self.cache_stat = stat
                 continue
             if multi:                                   # DeepSeek --parallel: `T <rid> <id>`, `PP <rid> ...`, `DONE <rid> ...`, `ERR <rid> ...`
                 head, _, rest = line.partition(" ")
@@ -4948,7 +4981,9 @@ class Service:
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
             # encoder's own default without that setting
-            slots = conversation_slots(engine)
+            # STRATA_PROMPT_KEEP: that many instead (a server with many tenants keeps a prompt a conversation
+            # in flight or recently counted; each costs its text and ids in RAM)
+            slots = prompt_keep_setting() or conversation_slots(engine)
             self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
                 else PromptEncoder(tokenizer)
 
@@ -5763,7 +5798,8 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
+                                                              getattr(self.engine, "cache_stat", None)),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5805,6 +5841,24 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        kept = getattr(self.engine, "cache_stat", None) or {}
+        if kept:                                        # the DeepSeek engine's kept conversations (its CACHE line)
+            g = kept.get
+            rows += [
+                ("strata:conversation_cache_entries", "gauge", "Conversations kept, in RAM and in the folder",
+                 g("ram", 0) + g("folder", 0)),
+                ("strata:conversation_cache_bytes", "gauge", "Bytes of kept conversations, in RAM and in the folder",
+                 g("ram_bytes", 0) + g("folder_bytes", 0)),
+                ("strata:conversation_cache_folder_bytes", "gauge", "Bytes of kept conversations in the folder",
+                 g("folder_bytes", 0)),
+                ("strata:conversation_cache_folder_cap_bytes", "gauge", "The folder's cap", g("folder_cap_bytes", 0)),
+                ("strata:conversation_cache_shared_start_bytes", "gauge", "Bytes of kept shared starts", g("start_bytes", 0)),
+                ("strata:conversation_cache_scopes", "gauge", "Cache scopes that own kept state", g("scopes", 0)),
+                ("strata:conversation_cache_evictions_total", "counter", "Kept entries given up for room", g("evicted", 0)),
+                ("strata:conversation_cache_evicted_bytes_total", "counter", "Their bytes", g("evicted_bytes", 0)),
+                ("strata:conversation_cache_saved_total", "counter", "Conversations set aside", g("saved", 0)),
+                ("strata:conversation_cache_taken_total", "counter", "Conversations taken back", g("taken", 0)),
+            ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
