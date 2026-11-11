@@ -39,31 +39,66 @@ static void meta_tests(const fs::path& dir) {
     const std::string id = "strata-ds4-session-2 engine=test", path = (dir / "slot-1.meta").string();
     const std::vector<int32_t> toks = seq(100, 50);
     const std::vector<int64_t> cks = {40, 33, 7};
-    CHECK(sm::write(path, id, toks, 123456789ull, cks));
+    const std::string scope = "0123abcd";
+    std::string sc;
+    CHECK(sm::write(path, id, scope, toks, 123456789ull, cks));
     CHECK(!fs::exists(path + ".tmp"));   // (renamed over, no half file left)
     std::vector<int32_t> t;
     std::vector<int64_t> c;
     uint64_t bytes = 0;
-    CHECK(sm::read(path, id, 1000, t, bytes, c));
-    CHECK(t == toks && c == cks && bytes == 123456789ull);
+    CHECK(sm::read(path, id, 1000, sc, t, bytes, c));
+    CHECK(t == toks && c == cks && bytes == 123456789ull && sc == scope);
+    // the scope is the slot's owner: it comes back as written, the empty one too, and one no GEN line can carry
+    // (a space, a control byte, too long) is neither written nor read
+    CHECK(sm::write(path, id, "", toks, 5, cks) && sm::read(path, id, 1000, sc, t, bytes, c) && sc.empty());
+    CHECK(sm::write(path, id, "A-b_c.9", toks, 5, cks) && sm::read(path, id, 1000, sc, t, bytes, c) && sc == "A-b_c.9");
+    CHECK(sm::write(path, id, std::string(sm::kScopeMax, 'f'), toks, 5, cks) && sm::read(path, id, 1000, sc, t, bytes, c));
+    CHECK(!sm::write(path, id, std::string(sm::kScopeMax + 1, 'f'), toks, 5, cks));
+    CHECK(!sm::write(path, id, "two words", toks, 5, cks));
+    CHECK(!sm::write(path, id, std::string("a\0b", 3), toks, 5, cks));
+    CHECK(sm::scope_ok("") && sm::scope_ok("x") && !sm::scope_ok("a=b") && !sm::scope_ok("a,b") && !sm::scope_ok("a\n"));
+    {   // a .meta whose scope bytes were damaged into one no request can name is refused
+        CHECK(sm::write(path, id, scope, toks, 5, cks));
+        fs::copy_file(path, dir / "badscope.meta", fs::copy_options::overwrite_existing);
+        patch((dir / "badscope.meta").string(), 8 + 8 + id.size() + 8, ' ');
+        CHECK(!sm::read((dir / "badscope.meta").string(), id, 1000, sc, t, bytes, c));
+    }
+    {   // the layout before scopes ("DS4META2": no scope field) is refused: nobody owns it
+        const uint64_t old_magic = 0x324154454d345344ull, il = id.size(), nb = 9, nt = toks.size(), nc = 0;
+        std::FILE* o = std::fopen((dir / "old.meta").string().c_str(), "wb");
+        std::fwrite(&old_magic, 8, 1, o);
+        std::fwrite(&il, 8, 1, o);
+        std::fwrite(id.data(), 1, id.size(), o);
+        std::fwrite(&nb, 8, 1, o);
+        std::fwrite(&nt, 8, 1, o);
+        std::fwrite(toks.data(), sizeof(int32_t), toks.size(), o);
+        std::fwrite(&nc, 8, 1, o);
+        std::fwrite(&old_magic, 8, 1, o);
+        std::fclose(o);
+        CHECK(!sm::read((dir / "old.meta").string(), id, 1000, sc, t, bytes, c));
+        // ... whatever follows its magic: this layout's own bytes behind the old magic are refused too
+        CHECK(sm::write(path, id, scope, toks, 5, cks));
+        patch(path, 7, '2');
+        CHECK(!sm::read(path, id, 1000, sc, t, bytes, c));
+    }
     // no checkpoints is valid (a slot of a state that had none)
-    CHECK(sm::write(path, id, toks, 5, {}));
-    CHECK(sm::read(path, id, 1000, t, bytes, c) && c.empty() && bytes == 5);
+    CHECK(sm::write(path, id, scope, toks, 5, {}));
+    CHECK(sm::read(path, id, 1000, sc, t, bytes, c) && c.empty() && bytes == 5);
     // another model's / engine's identity: refused, never read
-    CHECK(!sm::read(path, id + "x", 1000, t, bytes, c));
-    CHECK(!sm::read(path, "other", 1000, t, bytes, c));
+    CHECK(!sm::read(path, id + "x", 1000, sc, t, bytes, c));
+    CHECK(!sm::read(path, "other", 1000, sc, t, bytes, c));
     // more tokens than the context: refused
-    CHECK(!sm::read(path, id, 49, t, bytes, c));
-    CHECK(sm::read(path, id, 50, t, bytes, c));
+    CHECK(!sm::read(path, id, 49, sc, t, bytes, c));
+    CHECK(sm::read(path, id, 50, sc, t, bytes, c));
     // a missing file
-    CHECK(!sm::read((dir / "none.meta").string(), id, 1000, t, bytes, c));
+    CHECK(!sm::read((dir / "none.meta").string(), id, 1000, sc, t, bytes, c));
     // every cut length, a damaged magic at either end
-    CHECK(sm::write(path, id, toks, 9, cks));
+    CHECK(sm::write(path, id, scope, toks, 9, cks));
     const size_t full = (size_t) fs::file_size(path);
     for (size_t keep = 0; keep < full; ++keep) {
         fs::copy_file(path, dir / "cut.meta", fs::copy_options::overwrite_existing);
         fs::resize_file(dir / "cut.meta", keep);
-        if (sm::read((dir / "cut.meta").string(), id, 1000, t, bytes, c)) {
+        if (sm::read((dir / "cut.meta").string(), id, 1000, sc, t, bytes, c)) {
             std::printf("FAIL: a .meta cut to %zu of %zu bytes was read\n", keep, full);
             ++fails;
             break;
@@ -71,37 +106,64 @@ static void meta_tests(const fs::path& dir) {
     }
     fs::copy_file(path, dir / "bad0.meta", fs::copy_options::overwrite_existing);
     patch((dir / "bad0.meta").string(), 0, 0x55);
-    CHECK(!sm::read((dir / "bad0.meta").string(), id, 1000, t, bytes, c));
+    CHECK(!sm::read((dir / "bad0.meta").string(), id, 1000, sc, t, bytes, c));
     fs::copy_file(path, dir / "bad1.meta", fs::copy_options::overwrite_existing);
     patch((dir / "bad1.meta").string(), full - 1, 0x55);
-    CHECK(!sm::read((dir / "bad1.meta").string(), id, 1000, t, bytes, c));
+    CHECK(!sm::read((dir / "bad1.meta").string(), id, 1000, sc, t, bytes, c));
     // a checkpoint outside the conversation, a zero one, more than four
-    CHECK(sm::write(path, id, toks, 9, {51}));
-    CHECK(!sm::read(path, id, 1000, t, bytes, c));
-    CHECK(sm::write(path, id, toks, 9, {0}));
-    CHECK(!sm::read(path, id, 1000, t, bytes, c));
-    CHECK(sm::write(path, id, toks, 9, {4, 3, 2, 1}));
-    CHECK(sm::read(path, id, 1000, t, bytes, c) && c.size() == 4);
-    CHECK(sm::write(path, id, toks, 9, {1, 2, 3, 4, 5, 6, 7}));   // (the three and up to kMarksMax marks)
-    CHECK(sm::read(path, id, 1000, t, bytes, c) && c.size() == 7);
+    CHECK(sm::write(path, id, scope, toks, 9, {51}));
+    CHECK(!sm::read(path, id, 1000, sc, t, bytes, c));
+    CHECK(sm::write(path, id, scope, toks, 9, {0}));
+    CHECK(!sm::read(path, id, 1000, sc, t, bytes, c));
+    CHECK(sm::write(path, id, scope, toks, 9, {4, 3, 2, 1}));
+    CHECK(sm::read(path, id, 1000, sc, t, bytes, c) && c.size() == 4);
+    CHECK(sm::write(path, id, scope, toks, 9, {1, 2, 3, 4, 5, 6, 7}));   // (the three and up to kMarksMax marks)
+    CHECK(sm::read(path, id, 1000, sc, t, bytes, c) && c.size() == 7);
     {
         std::vector<int64_t> too_many;
         for (int64_t i = 1; i <= 20; ++i) too_many.push_back(i);
-        CHECK(sm::write(path, id, toks, 9, too_many));
-        CHECK(!sm::read(path, id, 1000, t, bytes, c));
+        CHECK(sm::write(path, id, scope, toks, 9, too_many));
+        CHECK(!sm::read(path, id, 1000, sc, t, bytes, c));
     }
     // no tokens at all
-    CHECK(sm::write(path, id, {}, 9, {}));
-    CHECK(!sm::read(path, id, 1000, t, bytes, c));
+    CHECK(sm::write(path, id, scope, {}, 9, {}));
+    CHECK(!sm::read(path, id, 1000, sc, t, bytes, c));
     // an unwritable place: false, not a crash
-    CHECK(!sm::write((dir / "nodir" / "x.meta").string(), id, toks, 1, {}));
+    CHECK(!sm::write((dir / "nodir" / "x.meta").string(), id, scope, toks, 1, {}));
 }
 
 static size_t pick(const std::vector<std::vector<int32_t>>& toks, const std::vector<std::vector<int64_t>>& cks,
                    const std::vector<int>& prompt, size_t floor, size_t* len) {
+    static const std::string one = "scope-one";
     std::vector<sm::Cand> c;
-    for (size_t i = 0; i < toks.size(); ++i) c.push_back({&toks[i], &cks[i]});
-    return sm::pick(c, prompt, floor, len);
+    for (size_t i = 0; i < toks.size(); ++i) c.push_back({&toks[i], &cks[i], &one});
+    return sm::pick(c, one, prompt, floor, len);
+}
+
+// A conversation is taken back by its own scope only: not whole, not at a checkpoint, not by the empty scope.
+static void scope_pick_tests() {
+    size_t len = 99;
+    const std::vector<int32_t> a = seq(1000, 3000);
+    std::vector<int32_t> a_turn = a;
+    for (int32_t x : seq(9000, 40)) a_turn.push_back(x);
+    const std::vector<int64_t> none, cks = {2950, 2000, 1000};
+    const std::string s1 = "aaaa", s2 = "bbbb", empty;
+    CHECK(sm::pick({{&a, &none, &s1}}, s1, as_int(a_turn), 0, &len) == 0 && len == a.size());
+    CHECK(sm::pick({{&a, &none, &s1}}, s2, as_int(a_turn), 0, &len) == SIZE_MAX && len == 0);
+    CHECK(sm::pick({{&a, &none, &s1}}, empty, as_int(a_turn), 0, &len) == SIZE_MAX && len == 0);
+    CHECK(sm::pick({{&a, &none, &empty}}, s1, as_int(a_turn), 0, &len) == SIZE_MAX && len == 0);
+    CHECK(sm::pick({{&a, &none, &empty}}, empty, as_int(a_turn), 0, &len) == 0 && len == a.size());
+    // the same conversation kept by two scopes: each takes its own
+    CHECK(sm::pick({{&a, &none, &s1}, {&a, &none, &s2}}, s2, as_int(a_turn), 0, &len) == 1 && len == a.size());
+    CHECK(sm::pick({{&a, &none, &s1}, {&a, &none, &s2}}, s1, as_int(a_turn), 0, &len) == 0 && len == a.size());
+    // a checkpoint of another scope's conversation is no restore point either
+    std::vector<int32_t> retry(a.begin(), a.begin() + 2960);
+    for (int32_t x : seq(8000, 30)) retry.push_back(x);
+    CHECK(sm::pick({{&a, &cks, &s1}}, s1, as_int(retry), 0, &len) == 0 && len == 2950);
+    CHECK(sm::pick({{&a, &cks, &s1}}, s2, as_int(retry), 0, &len) == SIZE_MAX && len == 0);
+    // a longer match in another scope does not hide the caller's own shorter one
+    std::vector<int32_t> a_short(a.begin(), a.begin() + 1000);
+    CHECK(sm::pick({{&a, &none, &s1}, {&a_short, &none, &s2}}, s2, as_int(a_turn), 0, &len) == 1 && len == 1000);
 }
 
 static void pick_tests() {
@@ -153,6 +215,7 @@ int main() {
     fs::create_directories(dir);
     meta_tests(dir);
     pick_tests();
+    scope_pick_tests();
     fs::remove_all(dir, ec);
     std::printf(fails ? "FAILED: %d\n" : "slot_test: all passed\n", fails);
     return fails ? 1 : 0;

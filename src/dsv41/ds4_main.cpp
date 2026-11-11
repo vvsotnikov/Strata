@@ -21,6 +21,9 @@
 // start of the last user message, a point near the prompt's tail; ds4_marks.hpp, STRATA_DS4_RESTORE_POINTS of them at
 // most a conversation, 4; 0: none kept), where a prompt that leaves the conversation after one goes back to it instead
 // of further.  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
+// `scope=<id>` on a GEN names the request's cache scope (the server's tenant; none: the empty scope).  Every reuse
+// above stays inside it: a request never goes on from a state, a kept conversation, a shared start or a picture that
+// a request of another scope read, so neither its reused count nor its speed says what another scope sent.
 #if defined(__APPLE__)
 #include <execinfo.h>
 #include <csignal>
@@ -359,6 +362,7 @@ struct Req {
     // (-1: the whole context, which the engine caps at its window; 0: none)
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+    std::string scope;  // scope=<id>: the only requests whose kept state this one may go on from, and the reverse
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -441,20 +445,26 @@ bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
     return ok;
 }
 
-// the encoded spans, the latest few (a conversation sends its pictures with every turn)
+// the encoded spans, the latest few (a conversation sends its pictures with every turn), each the scope's that
+// encoded it: the same picture from another scope is encoded again
 struct SpanCache {
-    std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<uint16_t>>>> q;
-    std::shared_ptr<const std::vector<uint16_t>> get(strata::ds4::Model& m, const Pic& p, std::string& err) {
+    struct Key {
+        std::string scope;
+        uint64_t hash;
+    };
+    std::deque<std::pair<Key, std::shared_ptr<const std::vector<uint16_t>>>> q;
+    std::shared_ptr<const std::vector<uint16_t>> get(strata::ds4::Model& m, const std::string& scope, const Pic& p,
+                                                     std::string& err) {
         for (size_t i = 0; i < q.size(); ++i)
-            if (q[i].first == p.hash) {
+            if (q[i].first.hash == p.hash && q[i].first.scope == scope) {
                 auto r = q[i].second;
                 q.erase(q.begin() + (long) i);
-                q.emplace_front(p.hash, r);
+                q.emplace_front(Key{scope, p.hash}, r);
                 return r;
             }
         auto rows = std::make_shared<std::vector<uint16_t>>();
         if (!m.encode_image(p.rgb.data(), p.width, p.height, *rows, err)) return nullptr;
-        q.emplace_front(p.hash, rows);
+        q.emplace_front(Key{scope, p.hash}, rows);
         if (q.size() > 8) q.pop_back();
         return rows;
     }
@@ -507,8 +517,10 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "rid") r.rid = std::atoll(v.c_str());
+        else if (k == "scope") r.scope = v;
     }
-    return !r.ids.empty() && (!geni || !r.file.empty());
+    // (a scope the engine could not keep is refused: read as no scope, it would join the requests that name none)
+    return !r.ids.empty() && (!geni || !r.file.empty()) && strata::ds4::slotmeta::scope_ok(r.scope);
 }
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
@@ -558,6 +570,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // conversation bigger than the cap stays).  STRATA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
     // shorter one is read again in about the time its slot would take).  Text only: a conversation that holds pictures
     // is not set aside, and a prompt with pictures takes none back.
+    // CACHE SCOPES: seq_scope names the scope that read the state each conversation of the model holds, and every
+    // slot and shared start carries its own; a request reads on only from what its own scope left (GEN scope=<id>).
+    std::vector<std::string> seq_scope((size_t) std::max(1, m.seq_count()));
+    const auto state_scope = [&]() -> std::string& { return seq_scope[(size_t) m.seq_bound()]; };
+    std::fprintf(stderr, "ds4 serve: cache scopes on: a request reuses only what its own scope read (GEN scope=<id>)\n");
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
@@ -574,6 +591,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
+        std::string scope;                            // the scope that read it: no other takes it back
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
@@ -589,14 +607,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return std::string(s);
     };
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
-                                const std::vector<int64_t>& cks) -> bool {
-        return strata::ds4::slotmeta::write(path, slot_identity, toks, bytes, cks);
+    const auto meta_write = [&](const std::string& path, const std::string& scope, const std::vector<int32_t>& toks,
+                                uint64_t bytes, const std::vector<int64_t>& cks) -> bool {
+        return strata::ds4::slotmeta::write(path, slot_identity, scope, toks, bytes, cks);
     };
-    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               std::vector<int64_t>& cks) -> bool {
-        return strata::ds4::slotmeta::read(path, slot_identity, m.max_context(), toks, bytes, cks);
+    // a .meta of this model -> its scope, its tokens and the slot's size (false: foreign, damaged, not this model's,
+    // or written before slots had a scope)
+    const auto meta_read = [&](const std::string& path, std::string& scope, std::vector<int32_t>& toks,
+                               uint64_t& bytes, std::vector<int64_t>& cks) -> bool {
+        return strata::ds4::slotmeta::read(path, slot_identity, m.max_context(), scope, toks, bytes, cks);
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -677,7 +696,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         }
         fs::rename(path + ".tmp", path, ec);
-        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks)) {
+        if (ec || !meta_write(meta_of(path), s.scope, s.tokens, s.data->size(), s.cks)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
@@ -704,10 +723,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                      "when it comes back\n", e.c_str());
             return;
         }
-        for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
+        const std::string& owner = state_scope();
+        for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded (its scope's own)
+            if (slots[i].scope == owner && slots[i].tokens.size() <= t.size() &&
+                std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), owner});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -732,14 +753,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // to - back in the model: the tokens it covers (0: none).  A conversation the prompt continues whole comes back
     // whole (`whole`); one it leaves part way - a retried prompt, a history the client renders again without the
     // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
-    // position before it, the anchor where its run of continued prompts began).
-    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole) -> size_t {
+    // position before it, the anchor where its run of continued prompts began).  Only `scope`'s own conversations.
+    const auto slot_take = [&](const std::vector<int>& prompt, const std::string& scope, size_t floor,
+                               bool& whole) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
         std::vector<strata::ds4::slotmeta::Cand> cands;
-        for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks});
+        for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks, &sl.scope});
         size_t len = 0;
-        const size_t best = strata::ds4::slotmeta::pick(cands, prompt, floor, &len);
+        const size_t best = strata::ds4::slotmeta::pick(cands, scope, prompt, floor, &len);
         if (best == SIZE_MAX) return 0;
         const size_t whole_len = slots[best].tokens.size();
         const auto t0 = std::chrono::steady_clock::now();
@@ -799,17 +821,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<int32_t> tokens;
         std::vector<uint8_t> data;
         uint64_t used = 0;
+        std::string scope;   // the scope that read it: no other takes it back
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
     const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("STRATA_DS4_PREFIX_KEEP", 2)) : 0;
     const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("STRATA_DS4_PREFIX_GB", 2)) * 1073741824.0);
     const size_t prefix_min = (size_t) std::max(1.0, env_num("STRATA_DS4_PREFIX_MIN", 1024));
-    // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
-    const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor) -> int {
+    // the longest kept start of `scope` the prompt begins with, past `floor` tokens and short of its last token
+    // (none: -1)
+    const auto prefix_find = [&](const std::vector<int>& prompt, const std::string& scope, const std::vector<Pic>& want,
+                                 size_t floor) -> int {
         int best = -1;
         for (size_t i = 0; i < prefixes.size(); ++i) {
             const auto& t = prefixes[i].tokens;
+            if (prefixes[i].scope != scope) continue;
             if (t.size() <= floor || t.size() + 1 > prompt.size() ||
                 (best >= 0 && t.size() <= prefixes[(size_t) best].tokens.size()))
                 continue;
@@ -826,8 +852,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const std::vector<int32_t> t = at > 0 ? std::vector<int32_t>(m.tokens().begin(), m.tokens().begin() + (long) at)
                                               : m.tokens();
         if (prefix_max <= 0 || t.size() < prefix_min) return;
+        const std::string& owner = state_scope();
         for (Prefix& p : prefixes)
-            if (p.tokens == t) {
+            if (p.scope == owner && p.tokens == t) {
                 p.used = ++prefix_clock;
                 return;
             }
@@ -841,6 +868,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         if (bytes > prefix_budget) return;
         p.tokens = t;
+        p.scope = owner;
         p.used = ++prefix_clock;
         prefixes.push_back(std::move(p));
         uint64_t total = 0;
@@ -889,6 +917,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 uint64_t bytes;
                 std::vector<int64_t> cks;
                 fs::file_time_type t;
+                std::string scope;
             };
             std::vector<Found> found;
             size_t refused = 0;
@@ -903,9 +932,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 if (!is_meta) continue;      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-                Found fd{bin, {}, 0, {}, fs::last_write_time(de.path(), ec)};
+                Found fd{bin, {}, 0, {}, fs::last_write_time(de.path(), ec), {}};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-                if (meta_read(p, fd.toks, fd.bytes, fd.cks) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days)
+                if (meta_read(p, fd.scope, fd.toks, fd.bytes, fd.cks) && have == fd.bytes && fd.bytes > 0 &&
+                    slot_age_days(p) <= slot_days)
                     found.push_back(std::move(fd));
                 else {
                     ++refused;
@@ -923,11 +953,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             uint64_t total = 0;
             for (auto& fd : found) {
                 total += fd.bytes;
-                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
+                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks),
+                                 std::move(fd.scope)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
-            if (refused) msg += ", " + std::to_string(refused) + " not this model's or incomplete - removed";
+            if (refused)
+                msg += ", " + std::to_string(refused) + " not this model's, incomplete or without a scope - removed";
             note(msg);
             slot_trim("");   // (the folder over STRATA_DS4_SLOT_GB: the least recently used conversation goes first)
         }
@@ -1046,8 +1078,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
+        // (the state another scope read shares nothing with this prompt, whatever its tokens: it is set aside for its
+        //  own scope below, and this prompt starts from its own scope's kept states or from nothing)
+        const bool mine = state_scope() == r.scope;
         size_t c = 0;
-        while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+        while (mine && c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
         // the same tokens with another picture (or none) do not share the state from that picture's span on
         auto same = [](const std::vector<Pic>& v, const Pic& q) {
             for (const Pic& x : v)
@@ -1073,13 +1108,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
             if (held.empty()) slot_put("");
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
-            const int64_t rs = m.restorable(limit);
+            const int64_t rs = mine ? m.restorable(limit) : -1;   // (another scope's state: none of its checkpoints)
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation only
             //  when it covers more than either)
-            const int pi = prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+            const int pi = prefix_find(r.ids, r.scope, pics, rs > 0 ? (size_t) rs : 0);
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = pics.empty() ? slot_take(r.ids, std::max(rs > 0 ? (size_t) rs : 0, plen), whole) : 0;
+            const size_t back =
+                pics.empty() ? slot_take(r.ids, r.scope, std::max(rs > 0 ? (size_t) rs : 0, plen), whole) : 0;
             if (back > 0) {
                 from = back;
                 took = true;
@@ -1091,6 +1127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 from = (size_t) m.pos();
             else m.reset();
         }
+        state_scope() = r.scope;   // (from here the state is this request's: its own scope's, taken back, or empty)
         if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),
@@ -1109,7 +1146,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 for (const Pic& x : held)
                     if (x.start == q.start && x.hash == q.hash) q.len = x.len;
                 if (q.len > 0 && (size_t) q.start + q.len <= from) continue;
-                std::shared_ptr<const std::vector<uint16_t>> rows = spans.get(m, q, err);
+                std::shared_ptr<const std::vector<uint16_t>> rows = spans.get(m, r.scope, q, err);
                 if (!rows) {
                     ok = false;
                     break;
@@ -1826,8 +1863,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (seq_rid[(size_t) s] >= 0) continue;
                 bind(s);
                 const auto& st = m.tokens();
-                size_t c = 0;
-                while (c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+                size_t c = 0;   // (another scope's state counts as sharing nothing: prompt_begin reads none of it)
+                while (state_scope() == r.scope && c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
                 int64_t u = 0;
                 if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
                 else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));

@@ -132,6 +132,9 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   back when the next prompt continues it, also after a restart. Slots live in `ds4-slots` next to the run log, are capped at 2 GB
   (`STRATA_DS4_SLOT_GB`) and are removed after a week. The system prompt and tools shared by an agent
   and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off.
+  A server with several tenants names each request's tenant (`GEN ... scope=<id>`): the engine reuses only what a
+  request of the same scope read, so a tenant's token counts and speed say nothing about another tenant's prompts.
+  Conversations kept by a build without scopes are removed at start.
 
 Pictures are on by default: the engine reads them with its own vision tower (no separate picture reader). The tower waits in RAM (about 1 GB of pinned
 memory) and takes its 319 MiB of graphics memory only while a picture is being read, out of the room `--reserve-mib` keeps free; the experts get that room

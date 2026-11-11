@@ -1065,6 +1065,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_slot_test PRIVATE cxx_std_17)
+      # the serve loop over a model without weights (tests/dsv41/serve_fake_model.cpp): what a request reuses, and
+      # that it is its own cache scope's; no GPU, no model.  tests/dsv41/serve_scope_test.py <ds4_serve_fake> drives it
+      add_executable(ds4_serve_fake src/dsv41/ds4_main.cpp tests/dsv41/serve_fake_model.cpp src/platform/io_priority.cpp)
+      target_include_directories(ds4_serve_fake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_serve_fake PRIVATE cxx_std_17)
+      target_link_libraries(ds4_serve_fake PRIVATE Threads::Threads)
       # restore points (ds4_marks.hpp, from Project Maya #639): which point a prompt goes back to, which ones a read keeps
       add_executable(ds4_marks_test tests/dsv41/marks_test.cpp)
       target_include_directories(ds4_marks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
