@@ -416,22 +416,27 @@ class PromptEncoder:
     entry), so a second client does not evict the first.  `encode(..., store=False)` reads the kept prompts without
     writing one (a token count is not a conversation's turn).  The tokenizer needs `encode_marked` and
     `max_special_len`.
+
+    `scope` names whose prompt it is (a server's tenant; "" without): a prompt reuses, and replaces, only the kept
+    prompts of its own scope, so how long an encode takes says nothing about what another scope sent.
     """
 
     def __init__(self, tok, keep: int = 4):
         self.tok, self.keep = tok, keep
-        # (text, plain spans, ids, mark ends, mark counts)
-        self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
+        # (text, plain spans, ids, mark ends, mark counts, scope)
+        self.entries: list[tuple[str, tuple, list[int], list[int], list[int], str]] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
 
-    def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
+    def encode(self, text: str, plain=(), store: bool = True, scope: str = "") -> list[int]:
         plain = tuple(sorted(plain))
         with self.lock:
             entries = self.entries                      # replaced, never changed in place
         margin = self.tok.max_special_len - 1
         src, cut_k = None, -1
         for e in entries:
+            if e[5] != scope:                           # another scope's prompt: never compared, never reused
+                continue
             same = plain_agree_until(e[1], plain, common_prefix_len(e[0], text))
             k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
             if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
@@ -454,7 +459,8 @@ class PromptEncoder:
         # prompts one conversation: only the entry whose text is mostly reused is replaced
         old = src if src is not None and 2 * src[3][cut_k] > len(src[0]) else None
         with self.lock:
-            self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
+            self.entries = [(text, plain, ids, ends, counts, scope)] + \
+                [e for e in self.entries if e is not old][:self.keep - 1]
         return list(ids)
 
     def forget(self, ids: list[int]) -> None:

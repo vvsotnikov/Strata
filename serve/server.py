@@ -774,6 +774,26 @@ OPENS_BROWSER = False        # set in main() when the server was started with --
 RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
 
 
+# "strata_cache_scope": whose request this is, set by a front end that knows its tenants (never by an end user: the
+# front end overwrites it).  The DeepSeek engine and the prompt encoder reuse only what a request of the same scope
+# left - kept conversations, restore points, shared starts, pictures, encoded prompts - so a tenant's cached-token
+# counts and timings say nothing about another tenant's prompts.  Absent: the one scope of requests that name none.
+CACHE_SCOPE_KEY = "strata_cache_scope"
+CACHE_SCOPE_MAX = 256
+
+
+def cache_scope(req) -> str:
+    """The request's cache scope as the engine takes it (GEN scope=<id>): a digest of "strata_cache_scope", so the
+    value itself reaches no engine line or log; "" without one.  A value that is not a short non-empty string is a
+    ValueError (a 400): read as "no scope", the request would share the cache of every request that names none."""
+    value = req.get(CACHE_SCOPE_KEY) if isinstance(req, dict) else None
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value or len(value) > CACHE_SCOPE_MAX:
+        raise ValueError(f"{CACHE_SCOPE_KEY}: a non-empty string of at most {CACHE_SCOPE_MAX} characters")
+    return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
 def restore_point_settings(env=None) -> tuple[bool, int]:
     """(on, tail) from STRATA_DS4_RESTORE_POINTS and STRATA_DS4_RESTORE_TAIL."""
     env = os.environ if env is None else env
@@ -1729,6 +1749,10 @@ class StrataEngine:
                 keys += f" pin={pn}"
         # restore points (Service.prepare puts them in `_restore`; only the DeepSeek engine gets them)
         keys += StrataEngine.restore_keys(sampling)
+        # the request's cache scope (Service.prepare checked it: only the DeepSeek engine keeps caches apart by it)
+        scope = cache_scope(sampling)
+        if scope:
+            keys += f" scope={scope}"
         # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
         # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
         k = top_logprobs(sampling)
@@ -5847,19 +5871,19 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, store: bool = True, scope: str = "") -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
-        prompts without adding or replacing one."""
+        prompts without adding or replacing one.  `scope` (cache_scope): only that scope's kept prompts are reused."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
-            return self.prompts.encode(prompt, plain, store)
+            return self.prompts.encode(prompt, plain, store, scope)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
             self.tok.encode(prompt, parse_special=True)
 
@@ -5941,8 +5965,11 @@ class Service:
                         part.update(type="text", text=f"[image omitted: {why}]")
                     else:
                         part["source"] = str(image)
+        scope = cache_scope(req)                         # a bad value is a 400 before anything is read or kept
+        if scope and self.family != "deepseek41":
+            raise ValueError(f"{CACHE_SCOPE_KEY}: only the DeepSeek engine keeps its caches apart by scope")
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, scope=scope)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -8938,7 +8965,8 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False,
+                                                                   scope=cache_scope(req)))})
 
         def _anthropic(self, req):
             svc.load()
