@@ -89,6 +89,44 @@ class Encoder(unittest.TestCase):
         self.assertEqual(sorted((e[5], len(e[0])) for e in enc.entries),
                          [("one", len(self.TEXT) + 12), ("two", len(self.TEXT) + 5)])
 
+    def test_a_scope_that_fills_the_encoder_gives_up_its_own_prompts(self):
+        tok = ByteTokenizer()
+        enc = PromptEncoder(tok, keep=4)
+        quiet = "<|im_start|>user\nthe quiet scope's only prompt " + "q" * 400 + "<|im_end|>\n<|im_start|>assistant\nyes"
+        enc.encode(quiet, scope="quiet")
+        for n in range(40):                                        # requests or counts of one scope, all different
+            enc.encode(f"<|im_start|>user\nprompt {n} " + chr(97 + n % 26) * 400 + "<|im_end|>\n", scope="busy")
+        self.assertEqual(len(enc.entries), 4)
+        self.assertEqual(sorted(e[5] for e in enc.entries), ["busy", "busy", "busy", "quiet"])
+        self.assertEqual([e[0].split()[2] for e in enc.entries if e[5] == "busy"], ["39", "38", "37"])
+        enc.encode(quiet + " and more<|im_end|>\n", scope="quiet")
+        self.assertGreater(enc.last_reused, len(quiet) // 2)       # the least recently used of all, and still kept
+
+    def test_scopes_that_keep_the_same_give_up_the_least_recently_used(self):
+        enc = PromptEncoder(ByteTokenizer(), keep=3)
+        for scope in ("one", "two", "three", "four"):
+            enc.encode(f"<|im_start|>user\n{scope} " + scope[0] * 300 + "<|im_end|>\n", scope=scope)
+        self.assertEqual([e[5] for e in enc.entries], ["four", "three", "two"])
+
+    def test_the_tokenizer_keeps_nothing_between_encodes(self):
+        # (pieces remembered across encodes made the time of an encode tell what any scope had sent before)
+        sys.path.insert(0, str(ROOT / "tools"))
+        import strata_tokenizer as ST
+        tokens = [ST.BYTE_TO_UNICODE[b] for b in range(256)]
+        merges = ["t h", "th e", "the r", "ther e"]
+        for m in merges:
+            tokens.append("".join(m.split(" ")))
+        tok = ST.Tokenizer(tokens, merges)
+        merged, real = [], tok._bpe
+        tok._bpe = lambda word: merged.append(word) or real(word)
+        counts = []
+        for text in ("there other", "there other", "there other there"):
+            del merged[:]
+            tok.encode(text)
+            counts.append(len(merged))
+        self.assertEqual(counts, [2, 2, 3])                        # every encode merges its own pieces, once each
+        self.assertFalse(hasattr(tok, "_piece_ids"))
+
     def test_a_count_reads_only_its_own_scope_s_prompts(self):
         tok = ByteTokenizer()
         enc = PromptEncoder(tok)

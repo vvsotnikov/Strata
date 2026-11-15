@@ -322,7 +322,7 @@ def toy() -> ST.Tokenizer:
 
 
 class PieceCache(unittest.TestCase):
-    def test_same_ids_cold_warm_and_off(self):
+    def test_same_ids_first_again_and_off(self):
         rng = random.Random(7)
         words = ["the", "and", "in", "on", "there", "other", "x" * 70, "你好", "def", "return", "\n\n", "  "]
         text = "".join(rng.choice(words) + rng.choice([" ", "", "\n", "\t"]) for _ in range(3000))
@@ -330,18 +330,35 @@ class PieceCache(unittest.TestCase):
         a.PIECE_CACHE_MAX = 0
         want = a.encode(text)
         b = toy()
-        cold = b.encode(text)
-        warm = b.encode(text)
-        self.assertEqual(cold, want)
-        self.assertEqual(warm, want)
-        self.assertGreater(len(b._piece_ids), 0)
-        self.assertEqual(b.decode(warm), text)
+        first = b.encode(text)
+        again = b.encode(text)
+        self.assertEqual(first, want)
+        self.assertEqual(again, want)
+        self.assertEqual(b.decode(again), text)
+
+    def merges(self, t, texts):
+        """How many pieces each encode of `texts` merged (calls of _bpe)."""
+        calls, out, real = [], [], t._bpe
+        t._bpe = lambda word: calls.append(word) or real(word)
+        for text in texts:
+            del calls[:]
+            t.encode(text)
+            out.append(len(calls))
+        return out
+
+    def test_a_repeated_piece_is_merged_once_an_encode(self):
+        self.assertEqual(self.merges(toy(), ["there there there there"]), [2])   # ("there" and " there")
+
+    def test_an_encode_leaves_nothing_a_later_one_reads(self):
+        # (kept across encodes, the time an encode took told whether its words had been sent before, by anyone)
+        t = toy()
+        self.assertEqual(self.merges(t, ["there other", "there other", "there other there"]), [2, 2, 3])
+        self.assertFalse(hasattr(t, "_piece_ids"))
 
     def test_the_cache_is_bounded(self):
         t = toy()
-        t.PIECE_CACHE_MAX = 5
-        t.encode(" ".join("w%d" % i for i in range(100)))
-        self.assertLessEqual(len(t._piece_ids), 5)
+        t.PIECE_CACHE_MAX = 0
+        self.assertEqual(self.merges(t, ["there there there"]), [3])
 
 
 class ByteCache(unittest.TestCase):

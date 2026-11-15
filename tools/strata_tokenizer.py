@@ -150,8 +150,7 @@ class Tokenizer:
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
         # Initialize once, rather than allocating a default dict and looking it up
-        # through __dict__.setdefault on each encoded segment or decoded token.
-        self._piece_ids: dict[str, list[int]] = {}
+        # through __dict__.setdefault on each decoded token.
         self._bytes_cache: dict[int, bytes] = {}
         # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
         self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
@@ -252,13 +251,15 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s in parts if s is not None]
 
-    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
+    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered within one encode (a long prompt repeats its words)
 
-    def _encode_plain(self, text: str) -> list[int]:
+    def _encode_plain(self, text: str, cache: dict[str, list[int]] | None = None) -> list[int]:
         out: list[int] = []
-        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
-        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
-        cache = self._piece_ids
+        cache = {} if cache is None else cache
+        # A piece's ids depend on the piece alone, so pieces the text repeats are looked up instead of merged again.
+        # The ids are the ones _bpe gives: this only skips the work.  `cache` lives for ONE encode and is never kept
+        # on the tokenizer: kept across encodes, how long a text took told whether its words had been sent before -
+        # by anyone, a server's other tenants included.
         for piece in self._split(text):
             got = cache.get(piece)
             if got is None:
@@ -285,8 +286,9 @@ class Tokenizer:
         `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
         the encoding of a longer text with the same beginning can resume (PromptEncoder).
         """
+        pieces: dict[str, list[int]] = {}               # this encode's own (see _encode_plain)
         if pat is None:
-            return self._encode_plain(text)
+            return self._encode_plain(text, pieces)
         out: list[int] = []
         pos = 0
         # Matches arrive in text order. For reusable span sequences, consume each
@@ -309,13 +311,13 @@ class Tokenizer:
             elif plain and any(a <= start < b for a, b in plain):
                 continue
             if start > pos:
-                out.extend(self._encode_plain(text[pos:start]))
+                out.extend(self._encode_plain(text[pos:start], pieces))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
             if marks is not None:
                 marks.append((pos, len(out)))
         if pos < len(text):
-            out.extend(self._encode_plain(text[pos:]))
+            out.extend(self._encode_plain(text[pos:], pieces))
         return out
 
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
@@ -418,7 +420,9 @@ class PromptEncoder:
     `max_special_len`.
 
     `scope` names whose prompt it is (a server's tenant; "" without): a prompt reuses, and replaces, only the kept
-    prompts of its own scope, so how long an encode takes says nothing about what another scope sent.
+    prompts of its own scope, so how long an encode takes says nothing about what another scope sent.  When `keep`
+    is reached the scope that keeps the most gives up its least recently used prompt (gives_way), so a scope that
+    fills the encoder - with requests or with token counts - makes room out of its own prompts.
     """
 
     def __init__(self, tok, keep: int = 4):
@@ -459,9 +463,24 @@ class PromptEncoder:
         # prompts one conversation: only the entry whose text is mostly reused is replaced
         old = src if src is not None and 2 * src[3][cut_k] > len(src[0]) else None
         with self.lock:
-            self.entries = [(text, plain, ids, ends, counts, scope)] + \
-                [e for e in self.entries if e is not old][:self.keep - 1]
+            kept = [e for e in self.entries if e is not old]
+            while kept and len(kept) > self.keep - 1:
+                kept.pop(self.gives_way(kept, scope))
+            self.entries = [(text, plain, ids, ends, counts, scope)] + kept
         return list(ids)
+
+    @staticmethod
+    def gives_way(kept: list, scope: str) -> int:
+        """Which of `kept` (most recently used first) makes room for a new prompt of `scope`: the least recently used
+        prompt of the scope that keeps the most, the new one counted in.  With equal counts, the least recently used."""
+        held: dict[str, int] = {scope: 1}
+        for e in kept:
+            held[e[5]] = held.get(e[5], 0) + 1
+        out = len(kept) - 1
+        for i in range(len(kept) - 2, -1, -1):
+            if held[kept[i][5]] > held[kept[out][5]]:
+                out = i
+        return out
 
     def forget(self, ids: list[int]) -> None:
         """The prompt with these ids was refused: it is not kept."""
