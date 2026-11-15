@@ -135,6 +135,8 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   A server with several tenants names each request's tenant (`GEN ... scope=<id>`): the engine reuses only what a
   request of the same scope read, so a tenant's token counts and speed say nothing about another tenant's prompts.
   Conversations kept by a build without scopes are removed at start.
+  When a cap is reached, the scope that holds the most gives up its least recently used entry, so a tenant that fills the
+  cache makes room out of its own conversations, shared starts and pictures and not out of a smaller tenant's.
   `STRATA_DS4_PICTURE_KEEP` (8) is how many pictures' encodings are kept. After each request the engine writes a `CACHE` line
   (entries and bytes in RAM and in the folder, the caps, shared starts, pictures, scopes, and what was given up for room); the
   server shows it under `conversation_cache.kept` in `/metrics`.

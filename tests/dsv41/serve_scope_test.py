@@ -251,6 +251,49 @@ class Scopes(unittest.TestCase):
             self.assertEqual(e.gen(kept[0] + prompt(81, 50), "bbbb"), 0)
             self.assertEqual(e.gen(kept[3] + prompt(81, 50), "aaaa"), 0)
 
+    def test_a_scope_that_fills_the_folder_gives_up_its_own_conversations(self):
+        # (the folder holds two 2000-token conversations, RAM one)
+        e = self.engine({"STRATA_DS4_SLOT_CAP": "1", "STRATA_DS4_SLOT_GB": str(20000 / 2**30)})
+        quiet = prompt(100, 2000)
+        self.assertEqual(e.gen(quiet, "bbbb"), 0)
+        for i in range(12):                              # another scope keeps opening conversations
+            self.assertEqual(e.gen(prompt(101 + i, 2000), "aaaa"), 0)
+        self.assertGreater(e.cache["evicted"], 0)
+        self.assertEqual(e.cache["scopes"], 2)
+        # the quiet scope's only conversation is the least recently used of all, and is still there
+        self.assertGreaterEqual(e.gen(quiet + prompt(120, 50), "bbbb"), 1999)
+
+    def test_a_scope_that_fills_the_shared_starts_gives_up_its_own(self):
+        e = self.engine({"STRATA_DS4_SLOT_KEEP": "0", "STRATA_DS4_PREFIX_KEEP": "2"})
+        quiet = prompt(130, 1500)
+        self.assertEqual(e.gen(quiet + prompt(131, 300), "bbbb", " shared=1500"), 0)
+        for i in range(3):                               # another scope keeps three starts where two fit
+            self.assertEqual(e.gen(prompt(132 + i, 1500) + prompt(140, 300), "aaaa", " shared=1500"), 0)
+        self.assertEqual(e.cache["starts"], 2)
+        for i in range(5):                               # (every conversation of the model is taken by others)
+            self.assertEqual(e.gen(prompt(150 + i, 2000), "cccc"), 0)
+        self.assertEqual(e.gen(quiet + prompt(160, 300), "bbbb", " shared=1500"), 1500)
+
+    def test_a_scope_that_fills_the_pictures_gives_up_its_own(self):
+        log = os.path.join(self.dir, "encodes.log")
+        e = self.engine({"DS4_FAKE_ENCODE_LOG": log, "STRATA_DS4_PICTURE_KEEP": "2"})
+        files = []
+        for n, side in enumerate((2, 4, 6, 8)):
+            files.append(os.path.join(self.dir, f"picture-{n}.dsi"))
+            with open(files[-1], "wb") as f:
+                f.write(b"DSI1" + struct.pack("<i", 1) + struct.pack("<qii", 5, side, side) + bytes(side * side * 3))
+
+        def ask(seed, scope, picture):
+            ids = prompt(seed, 5) + [IMAGE_TOKEN] * SPAN + prompt(seed + 1, 40)
+            self.assertEqual(e.gen(ids, scope, pictures=picture), 0)
+            with open(log) as f:
+                return len(f.readlines())
+        self.assertEqual(ask(170, "bbbb", files[0]), 1)
+        for n in (1, 2, 3):                              # another scope sends three pictures where two fit
+            self.assertEqual(ask(170 + 2 * n, "aaaa", files[n]), 1 + n)
+        self.assertEqual(ask(180, "bbbb", files[0]), 4)  # the quiet scope's picture was not encoded again
+        self.assertEqual(ask(182, "aaaa", files[1]), 5)  # the busy scope's oldest was
+
     def test_the_number_of_kept_pictures_is_a_setting(self):
         for keep, encodes in ((None, 2), ("1", 3)):
             with self.subTest(keep=keep):

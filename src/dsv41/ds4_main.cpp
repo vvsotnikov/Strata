@@ -62,6 +62,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
@@ -447,8 +448,9 @@ bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
 }
 
 // the encoded spans, the latest few (a conversation sends its pictures with every turn), each the scope's that
-// encoded it: the same picture from another scope is encoded again.  STRATA_DS4_PICTURE_KEEP (8): how many are kept,
-// the least recently used giving way (a server with many tenants: a few a tenant)
+// encoded it: the same picture from another scope is encoded again.  STRATA_DS4_PICTURE_KEEP (8): how many are kept.
+// Past that the scope that holds the most gives up its least recently used, so a scope that fills the cache makes
+// room out of its own pictures and never out of a smaller scope's
 struct SpanCache {
     size_t keep = [] {
         const char* v = std::getenv("STRATA_DS4_PICTURE_KEEP");
@@ -472,7 +474,14 @@ struct SpanCache {
         auto rows = std::make_shared<std::vector<uint16_t>>();
         if (!m.encode_image(p.rgb.data(), p.width, p.height, *rows, err)) return nullptr;
         q.emplace_front(Key{scope, p.hash}, rows);
-        while (q.size() > keep) q.pop_back();
+        while (q.size() > keep) {
+            std::unordered_map<std::string, size_t> held;
+            for (const auto& e : q) ++held[e.first.scope];
+            size_t out = q.size() - 1;   // (the back is the least recently used: it goes when no scope holds more)
+            for (size_t i = q.size(); i-- > 0;)
+                if (held[q[i].first.scope] > held[q[out].first.scope]) out = i;
+            q.erase(q.begin() + (long) out);
+        }
         return rows;
     }
 };
@@ -570,10 +579,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // (default <pack>/slots): a slot is a .bin (the state) and a .meta (this model's identity, the conversation's
     // tokens and its size), both written under a temporary name first; a slot whose .meta is missing, foreign or does
     // not match its file, or unused for STRATA_DS4_SLOT_DAYS (7) days, is removed at start.  STRATA_DS4_SLOT_CAP (4) is
-    // the conversations kept in RAM; past it the least recently used is written to the folder and read back from there
+    // the conversations kept in RAM; past it one is written to the folder (slot_victim's) and read back from there
     // (RAM first, the folder past the cap), and the engine's end writes the ones in RAM to the folder, so the next run
     // reads on from them.  STRATA_DS4_SLOT_GB (16) caps the folder's .bin files: at start, and after every write, the
-    // folder's least recently used conversation is removed while they are over it (never the one just written, so a
+    // folder gives one up while they are over it (slot_victim's again; never the one just written, so a
     // conversation bigger than the cap stays).  STRATA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
     // shorter one is read again in about the time its slot would take).  Text only: a conversation that holds pictures
     // is not set aside, and a prompt with pictures takes none back.
@@ -655,16 +664,33 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     // what the caches hold, for the server's metrics: a CACHE line on stdout after each request's reuse was settled
     uint64_t n_saved = 0, n_taken = 0, n_evicted = 0, evicted_bytes = 0;
-    // the folder over STRATA_DS4_SLOT_GB: its least recently used conversation goes first, and never `keep` (the one just
+    // WHO GIVES WAY when a cap is reached: the scope that holds the most bytes of that part (RAM, or the folder), its
+    // least recently used conversation.  A scope that fills the cache makes room out of its own, so no scope loses
+    // what it keeps to another's traffic while it holds less than that one.  `keep`: a path never given up
+    // (SIZE_MAX: nothing can go)
+    const auto slot_victim = [&](bool ram, const std::string& keep) -> size_t {
+        std::unordered_map<std::string, uint64_t> held;
+        for (const Slot& s : slots)
+            if ((s.data != nullptr) == ram) held[s.scope] += s.bytes;
+        size_t out = SIZE_MAX;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if ((slots[i].data != nullptr) != ram || (!ram && slots[i].path == keep)) continue;
+            if (out == SIZE_MAX) {
+                out = i;
+                continue;
+            }
+            const uint64_t a = held[slots[i].scope], b = held[slots[out].scope];
+            if (a > b || (a == b && slots[i].used < slots[out].used)) out = i;
+        }
+        return out;
+    };
+    // the folder over STRATA_DS4_SLOT_GB: slot_victim's conversation goes first, and never `keep` (the one just
     // written), so a conversation bigger than the cap stays
     const auto slot_trim = [&](const std::string& keep) {
         const uint64_t before = slot_folder_bytes();
         size_t dropped = 0;
         while (slot_folder_bytes() > slot_budget) {
-            size_t lru = SIZE_MAX;
-            for (size_t i = 0; i < slots.size(); ++i)
-                if (!slots[i].data && slots[i].path != keep && (lru == SIZE_MAX || slots[i].used < slots[lru].used))
-                    lru = i;
+            const size_t lru = slot_victim(false, keep);
             if (lru == SIZE_MAX) break;
             ++n_evicted;
             evicted_bytes += slots[lru].bytes;
@@ -673,8 +699,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         if (dropped > 0) {
             char msg[256];
-            std::snprintf(msg, sizeof msg, "the folder held %s (over STRATA_DS4_SLOT_GB, %s): %zu least recently used "
-                          "conversation(s) removed, %s left", gb(before).c_str(), gb(slot_budget).c_str(), dropped,
+            std::snprintf(msg, sizeof msg, "the folder held %s (over STRATA_DS4_SLOT_GB, %s): %zu conversation(s) of the "
+                          "scope(s) holding the most removed, %s left", gb(before).c_str(), gb(slot_budget).c_str(), dropped,
                           gb(slot_folder_bytes()).c_str());
             note(msg);
         }
@@ -712,7 +738,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         s.path = path;
         s.bytes = s.data->size();
         s.data.reset();
-        slot_trim(path);   // (the folder over its cap: the least recently used conversation goes, not this one)
+        slot_trim(path);   // (the folder over its cap: slot_victim's conversation goes, not this one)
         return true;
     };
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
@@ -737,13 +763,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 slot_drop(i);
         slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), owner});
         slots.back().data = buf;
-        while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
+        while (true) {   // past the cap: slot_victim's conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
             if (ram <= slot_max) break;
-            size_t lru = SIZE_MAX;
-            for (size_t i = 0; i < slots.size(); ++i)
-                if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
+            const size_t lru = slot_victim(true, "");
             if (lru == SIZE_MAX) break;
             if (!slot_write_file(slots[lru])) {   // (not written: the conversation is lost)
                 ++n_evicted;
@@ -827,8 +851,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared start of a prompt read from
     // token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same start - after an
     // unrelated one, with or without STRATA_DS4_SLOT_KEEP - takes it back and reads only the rest.  It is the state the read
-    // itself keeps at that point (a whole read up to it).  STRATA_DS4_PREFIX_KEEP (2) starts at most, the least recently
-    // used giving way, STRATA_DS4_PREFIX_GB (2) their bytes at most, STRATA_DS4_PREFIX_MIN (1024) the shortest start kept;
+    // itself keeps at that point (a whole read up to it).  STRATA_DS4_PREFIX_KEEP (2) starts at most, the scope
+    // that holds the most giving up its least recently used, STRATA_DS4_PREFIX_GB (2) their bytes at most, STRATA_DS4_PREFIX_MIN (1024) the shortest start kept;
     // STRATA_DS4_PREFIX_KEEP=0: none.  Starts with pictures are not kept.
     struct Prefix {
         std::vector<int32_t> tokens;
@@ -886,10 +910,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         prefixes.push_back(std::move(p));
         uint64_t total = 0;
         for (const Prefix& x : prefixes) total += x.data.size();
+        // past a cap: the scope that holds the most bytes of starts gives up its least recently used (as slot_victim)
         while (prefixes.size() > 1 && ((int) prefixes.size() > prefix_max || total > prefix_budget)) {
+            std::unordered_map<std::string, uint64_t> held;
+            for (const Prefix& x : prefixes) held[x.scope] += x.data.size();
             size_t lru = 0;
-            for (size_t i = 1; i < prefixes.size(); ++i)
-                if (prefixes[i].used < prefixes[lru].used) lru = i;
+            for (size_t i = 1; i < prefixes.size(); ++i) {
+                const uint64_t a = held[prefixes[i].scope], b = held[prefixes[lru].scope];
+                if (a > b || (a == b && prefixes[i].used < prefixes[lru].used)) lru = i;
+            }
             total -= prefixes[lru].data.size();
             ++n_evicted;
             evicted_bytes += prefixes[lru].data.size();
@@ -1002,7 +1031,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (refused)
                 msg += ", " + std::to_string(refused) + " not this model's, incomplete or without a scope - removed";
             note(msg);
-            slot_trim("");   // (the folder over STRATA_DS4_SLOT_GB: the least recently used conversation goes first)
+            slot_trim("");   // (the folder over STRATA_DS4_SLOT_GB: slot_victim's conversation goes first)
         }
     }
     cache_line();   // (what a previous run left in the folder, before the first request)
