@@ -12,6 +12,7 @@ namespace strata::hy4 {
 struct ExpertDevice {
     int device = 0;            // Ordinal within CUDA_VISIBLE_DEVICES.
     size_t resident_bytes = 0; // Cache capacity, in addition to fixed workspace below.
+    bool elastic = false; // Auto capacity may shrink to measured free space, rounded down to2MiB.
 };
 
 struct ExpertMemory {
@@ -23,16 +24,23 @@ struct ExpertCacheStats {
     uint64_t calls = 0, routed_entries = 0, unique_experts = 0;
     uint64_t hits = 0, misses = 0; // Routed entries; hits + misses == routed_entries.
     uint64_t evictions = 0, uploads = 0, uploaded_bytes = 0;
+    uint64_t target_uploaded_bytes=0,draft_uploaded_bytes=0;
     uint64_t resident_calls = 0, metadata_readbacks = 0;
-    size_t cache_bytes = 0, cache_capacity = 0, pinned_bytes = 0; // pinned cache bytes, not host staging
+    size_t cache_bytes = 0, cache_capacity = 0, pinned_bytes = 0; // aligned occupied/pinned bytes
+    size_t resident_weight_bytes=0,pinned_weight_bytes=0,pinned_layers=0;
+    size_t arena_bytes = 0; // full cudaMalloc reservation, including unused cache space
+    size_t observed_driver_bytes = 0; // init free-memory delta; diagnostic under concurrent allocators
 };
 
-// Exact Hy4 latent experts. All selected experts execute; no routing approximation.
+// Hy4 latent experts preserve every selected route and the model clipping. Decode
+// retains native MMVQ arithmetic; wide prefill rounds operands to FP16/BF16 with
+// FP32 tensor-core accumulation, matching the standard Strata prefill convention.
 // Inputs/outputs are F32 device arrays, token-major. Routing weights are the normalized
 // original sigmoid probabilities (including expert_scale), not the biased selection scores.
 // Calls on one executor are serialized by its owner. Copies and launches are asynchronous
 // on private streams; run() joins their completion into caller_stream before returning.
-// Only selected expert IDs cross to the host on a streaming/cache-miss call. Activations,
+// Decode reads selected IDs; wide prefill reads only one count per expert on a
+// streaming/cache-miss call. Fully resident prefill groups routes entirely on GPU. Activations,
 // probabilities, and expert outputs stay on devices. A fully preloaded layer avoids this
 // readback. Full layers on another card use peer copies, never host activation staging.
 class ExpertExecutor {
@@ -56,7 +64,7 @@ class ExpertExecutor {
     // use routed fast kernels. Other formats use cached native MMVQs.
     bool preload_layer(int layer, int device = -1);
     void synchronize();
-    size_t reserved_bytes(int device) const; // Allocated VRAM including workspace/cache.
+    size_t reserved_bytes(int device) const; // Requested CUDA bytes: fixed workspace + entire arena.
     ExpertCacheStats stats() const;
 
   private:

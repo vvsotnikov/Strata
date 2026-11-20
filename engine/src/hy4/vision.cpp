@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -181,12 +182,37 @@ int round_even_multiple(int n, int factor) {
 }
 } // namespace
 
+size_t vision_detail::cuda_workspace_bytes(const Geometry &g, int pw, int ph) {
+    require(pw > 0 && ph > 0 && g.merge > 0 && pw % g.merge == 0 && ph % g.merge == 0,
+            "CUDA workspace image geometry");
+    const size_t count = size_t(pw) * ph, merged = count / (g.merge * g.merge);
+    const size_t inner = size_t(g.dim) * g.merge * g.merge;
+    const size_t floats = count * (3 * g.patch * g.patch + 12 * g.dim + g.ff) +
+                          count * std::min<size_t>(count, 128) * g.heads + merged * inner +
+                          merged * g.hidden + merged * g.out +
+                          size_t(pw / g.merge + 1) * (ph / g.merge) * g.out;
+    const size_t halves = count * std::max<size_t>({size_t(3 * g.patch * g.patch), size_t(g.dim),
+                                                  size_t(g.ff), size_t(g.hidden), inner});
+    return floats * sizeof(float) + halves * sizeof(uint16_t);
+}
+bool vision_detail::cuda_memory_fits(size_t available, size_t weights, size_t workspace,
+                                     size_t temporary, size_t reserve) {
+    // Subtract rather than sum so a malformed or huge estimate cannot wrap.
+    for (const size_t bytes : {weights, workspace, temporary, reserve}) {
+        if (bytes > available)
+            return false;
+        available -= bytes;
+    }
+    return true;
+}
+
 struct VisionEncoder::Impl {
     GgufModel model;
     std::map<std::string, Tensor> tensors;
     G g;
     VisionOptions options;
     std::unique_ptr<vision_detail::Backend> backend;
+    std::unique_ptr<vision_detail::Backend> cpu_fallback;
     explicit Impl(const std::string &path, VisionOptions o) : model(GgufModel::open(path, true)), options(o) {
         require(o.threads >= 1 && o.threads <= 256 && o.min_tokens >= 0 && o.max_tokens >= 0,
                 "invalid options");
@@ -382,7 +408,17 @@ VisionEmbedding VisionEncoder::encode_normalized(std::span<const float> chw, int
     result.patch_height = ph;
     result.width = pw / g.merge + 1;
     result.height = ph / g.merge;
-    result.rows = impl_->backend->encode(patches, positions, pw, ph, trace);
+    auto *backend = impl_->backend.get();
+    const std::string admission = backend->admission_error(pw, ph);
+    if (!admission.empty()) {
+        std::cerr << "Hy4 vision: " << admission << "; using native CPU encoder for this image\n";
+        if (!impl_->cpu_fallback) {
+            auto lookup = [p = impl_.get()](const std::string &name) -> const Tensor & { return p->at(name); };
+            impl_->cpu_fallback = std::make_unique<Cpu>(g, lookup, impl_->options.threads);
+        }
+        backend = impl_->cpu_fallback.get();
+    }
+    result.rows = backend->encode(patches, positions, pw, ph, trace);
     require(result.rows.size() == result.tokens() * g.out, "backend output dimensions");
     for (float x : result.rows)
         require(std::isfinite(x), "nonfinite image embedding");

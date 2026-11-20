@@ -46,7 +46,7 @@ def family_definition(base_url: str) -> dict:
         # Sparse layers retain one 576-wide MLA cell. SWA layers keep only 512
         # cells per slot; shared-context allocation is sized by the native engine.
         "kv_bytes_per_token": 12 * 576 * 2,
-        "context_max": CONTEXTS[-1], "contexts": list(CONTEXTS), "mtp": 0,
+        "context_max": CONTEXTS[-1], "contexts": list(CONTEXTS), "mtp": 2,
         "vision": True, "state_gb": 0.0,
     }
 

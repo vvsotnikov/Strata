@@ -866,7 +866,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
         req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        kwargs["enable_thinking"] = False
+        kwargs.update(effort_kwargs(False))
     elif effort:
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
@@ -878,7 +878,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
-        kwargs["enable_thinking"] = False
+        kwargs.update(effort_kwargs(False))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 

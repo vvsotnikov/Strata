@@ -24,6 +24,27 @@ template <class Action> void rejects(Action action) {
 } // namespace
 
 int main() {
+    // Admission accounts for peak live arrays rather than assuming every image
+    // fits the reserve measured for a tiny 64x64 image. No CUDA calls required.
+    vision_detail::Geometry geometry;
+    geometry.dim = 1152;
+    geometry.heads = 16;
+    geometry.ff = 4304;
+    geometry.patch = 16;
+    geometry.merge = 2;
+    geometry.hidden = 4608;
+    geometry.out = 3072;
+    const size_t tiny_workspace = vision_detail::cuda_workspace_bytes(geometry, 4, 4);
+    const size_t large_workspace = vision_detail::cuda_workspace_bytes(geometry, 128, 128);
+    check(tiny_workspace == 16 * size_t(3 * 16 * 16 + 12 * 1152 + 4304 + 16 * 16) * 4 +
+                                16 * size_t(4608) * 2 +
+                                (4 * size_t(4608 + 4608 + 3072) + 6 * size_t(3072)) * 4,
+          "exact live CUDA workspace accounting");
+    check(large_workspace > size_t(1) << 30, "large images require more than the tiny-image reserve");
+    check(vision_detail::cuda_memory_fits(100, 10, 20, 30, 40), "exact admission boundary");
+    check(!vision_detail::cuda_memory_fits(99, 10, 20, 30, 40), "insufficient VRAM rejected");
+    check(!vision_detail::cuda_memory_fits(100, std::numeric_limits<size_t>::max(), 20, 0, 0),
+          "admission arithmetic cannot wrap");
     // An actual 64x64 image has four 32x32 merged patches plus a newline
     // embedding at the end of each row. Newlines occupy an image-pad position.
     VisionEmbedding image;

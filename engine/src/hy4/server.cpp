@@ -1,5 +1,6 @@
 #include "strata/hy4/server.hpp"
 #include "strata/hy4/spec.hpp"
+#include "strata/hy4/profile.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -249,10 +250,11 @@ Request parse(const std::string &line, const Geometry &g, const ServerOptions &o
             require(!o.vision || t != o.image_pad, "image pads require GENI embeddings");
     return r;
 }
+struct CapacityWait { size_t prompt_tokens; };
 struct Active {
     Request request;
     int physical = -1;
-    bool reading = true, admitted = false, cancel = false, hold_seen = false;
+    bool reading = true, admitted = false, cancel = false, hold_seen = false, restored = false;
     size_t read = 0, reused = 0, produced = 0, offered = 0, accepted = 0;
     int32_t seed = 0;
     std::vector<int32_t> penalties;
@@ -268,14 +270,25 @@ class Server {
     std::vector<int32_t> eos;
     std::vector<std::optional<Active>> active;
     std::vector<std::vector<uint64_t>> keys;
+    struct Prefix {
+        std::vector<int32_t> tokens;
+        std::vector<uint64_t> keys;
+        Vec logits;
+    };
+    std::vector<Prefix> prefixes;
     std::vector<uint64_t> used;
     std::deque<std::pair<std::string, bool>> pending;
     uint64_t clock = 0;
+    Clock::time_point capacity_progress = Clock::now();
     size_t prefill_turn = 0;
     int control = -1;
     bool quitting = false;
     int status = 0;
     void say(const std::string &s) { io.write(s); }
+    void report_stats() {
+        try { say("INFO " + m.stats()); }
+        catch (const std::bad_alloc &) { /* Optional telemetry must not fail a response. */ }
+    }
     bool terminal(int32_t t) const { return std::find(eos.begin(), eos.end(), t) != eos.end(); }
     bool busy(int physical) const {
         for (const auto &a : active)
@@ -294,6 +307,7 @@ class Server {
                 break;
             m.reset(p);
             keys[p].clear();
+            prefixes[p] = {};
         }
         return m.free_tokens() >= room;
     }
@@ -332,17 +346,20 @@ class Server {
         if (!a.request.checkpoint) {
             m.reset(a.physical);
             keys[a.physical].clear();
+            prefixes[a.physical] = {};
         }
         used[a.physical] = ++clock;
         if (control == logical)
             control = -1;
         active[logical].reset();
+        report_stats();
     }
     void fault(int logical, const std::exception &error) {
         std::fprintf(stderr, "strata Hy4 slot %d: %s\n", logical, error.what());
         auto &a = *active[logical];
         m.reset(a.physical);
         keys[a.physical].clear();
+        prefixes[a.physical] = {};
         // A model execution failure may have left shared CUDA work incomplete. End
         // the process if its runtime rejects continued use, rather than recycle a slot.
         if (!m.healthy()) {
@@ -391,6 +408,21 @@ class Server {
         }
         if (o.mtp)
             m.draft_accept(a.physical, m.length(a.physical) - 1);
+        if (a.request.checkpoint && !a.restored) {
+            prefixes[a.physical] = {};
+            // Copy host metadata first: a failed allocation must never leave a
+            // new device snapshot paired with stale logits from an older prompt.
+            Prefix saved;
+            try {
+                saved.tokens = a.request.ids;
+                saved.keys = keys[a.physical];
+                saved.logits = logits;
+                if (m.checkpoint(a.physical))
+                    prefixes[a.physical] = std::move(saved);
+            } catch (const std::bad_alloc &) {
+                // A cache miss must not fail an otherwise valid response.
+            }
+        }
         if (a.request.slot_read && a.request.batch && !a.admitted) {
             say(done(a, "length"));
             say("BADM " + std::to_string(logical) + " 1");
@@ -418,14 +450,16 @@ class Server {
                 if (!a.request.checkpoint) {
                     m.reset(a.physical);
                     keys[a.physical].clear();
+                    prefixes[a.physical] = {};
                 }
                 active[logical].reset();
+                report_stats();
             } else
                 a.admitted = true;
         } else
             emit(logical, token);
     }
-    int admit(const std::string &line) {
+    int admit(const std::string &line, bool cancelled = false) {
         Request r = parse(line, g, o);
         int logical = r.batch ? r.slot : 0;
         if (r.batch) {
@@ -446,7 +480,12 @@ class Server {
         for (int p = 0; p < m.slots(); ++p)
             if (!busy(p)) {
                 const auto hist = m.history(p);
-                const size_t limit = std::min({hist.size(), r.ids.size() - 1, keys[p].size()});
+                const auto &saved = prefixes[p];
+                const bool exact = r.checkpoint && saved.tokens == r.ids && saved.keys.size() == r.cells.size() &&
+                    std::equal(saved.keys.begin(), saved.keys.end(), r.cells.begin(),
+                               [](uint64_t k, const Cell &c) { return k == c.key; }) &&
+                    saved.logits.size() == size_t(g.vocab);
+                const size_t limit = r.checkpoint ? std::min({hist.size(), r.ids.size() - (exact ? 0 : 1), keys[p].size()}) : 0;
                 size_t same = 0;
                 while (same < limit &&
                        (hist[same] == r.ids[same] ||
@@ -464,22 +503,45 @@ class Server {
             r.cells[best].embedding != SIZE_MAX && r.cells[best - 1].rope[0] == r.cells[best].rope[0])
             while (best > 0 && r.cells[best - 1].embedding != SIZE_MAX)
                 --best;
-        m.truncate(physical, best);
+        bool restored = best == r.ids.size() && m.restore_checkpoint(physical, best);
+        if (best == r.ids.size() && !restored)
+            --best;
+        if (!restored)
+            m.truncate(physical, best);
         best = m.length(physical);
-        require(best <= r.ids.size() - 1, "runtime prefix truncate failed");
+        require(best <= r.ids.size() - (restored ? 0 : 1), "runtime prefix truncate failed");
         if (o.mtp) {
             m.draft_truncate(physical, best);
             if (m.draft_length(physical) != best) {
                 m.reset(physical);
+                prefixes[physical] = {};
+                restored = false;
                 best = 0;
             }
         }
         keys[physical].resize(best);
         // Reclaim only idle cached prefixes, never another live conversation.
-        const size_t need = r.ids.size() - best + std::min(r.max_new, size_t(8));
-        require(reclaim(need, physical), "BGEN: shared KV pool is full");
+        // Reserve requested token budgets at admission, without allocating KV.
+        // Live prompts must not overcommit the shared pool and fail mid-response.
+        size_t promised = 0;
+        for (const auto &other : active) if (other) {
+            const size_t budget = other->request.ids.size() + other->request.max_new;
+            const size_t have = m.length(other->physical);
+            const size_t remaining = budget > have ? budget - have : 0;
+            require(remaining <= SIZE_MAX - promised, "KV reservation overflow");
+            promised += remaining;
+        }
+        const size_t need = r.ids.size() + r.max_new - best;
+        require(need <= SIZE_MAX - promised, "KV reservation overflow");
+        if (!cancelled && !reclaim(need + promised, physical)) {
+            if (std::any_of(active.begin(), active.end(), [](const auto &a) { return a.has_value(); }))
+                throw CapacityWait{r.ids.size()};
+            throw std::runtime_error("Hy4 serve: requested response exceeds shared KV capacity");
+        }
         Active a;
         a.request = std::move(r);
+        a.cancel = cancelled;
+        a.restored = restored;
         a.physical = physical;
         a.read = a.reused = best;
         a.target.seed(a.request.sampling.seed);
@@ -499,6 +561,14 @@ class Server {
             say("BADM " + std::to_string(logical) + " 1");
             active[logical]->admitted = true;
             control = -1;
+        }
+        if (restored) {
+            try {
+                admission(logical, prefixes[physical].logits);
+            } catch (const std::exception &e) {
+                if (active[logical])
+                    fault(logical, e);
+            }
         }
         return logical;
     }
@@ -575,17 +645,14 @@ class Server {
             }
             try {
                 const size_t take =
-                    std::min({size_t(o.prefill_chunk), size_t(m.batch()), a.request.ids.size() - a.read});
+                    std::min({size_t(o.prefill_chunk), size_t(m.prefill_batch()), a.request.ids.size() - a.read});
                 std::vector<DeviceInput> rows;
                 require(reclaim(take), "shared KV pool filled during prompt processing");
                 for (size_t i = 0; i < take; ++i)
                     rows.push_back(input(a, a.read + i));
-                const auto logits = m.forward(rows);
-                require(logits.size() == rows.size(), "runtime returned wrong logits row count");
-                if (o.mtp) {
-                    const auto draft = m.draft_forward(rows, true);
-                    require(draft.size() == rows.size(), "MTP prefill row count");
-                }
+                ProfileScope profile("hy4.prefill_window");
+                auto logits = m.prefill(rows, o.mtp != 0);
+                require(logits.size() == size_t(g.vocab), "runtime returned wrong prefill logits width");
                 for (size_t i = 0; i < take; ++i)
                     keys[a.physical].push_back(a.request.cells[a.read + i].key);
                 a.read += take;
@@ -597,7 +664,7 @@ class Server {
                     say(progress.str());
                 commands(false);
                 if (a.read == a.request.ids.size())
-                    admission(logical, logits.back());
+                    admission(logical, std::move(logits));
             } catch (const std::exception &e) {
                 fault(logical, e);
             }
@@ -605,6 +672,7 @@ class Server {
         }
     }
     void decode_plain(const std::vector<int> &logicals) {
+        ProfileScope profile("hy4.decode_plain");
         std::vector<DeviceInput> rows;
         for (int l : logicals) {
             const auto &a = *active[l];
@@ -613,7 +681,7 @@ class Server {
         const auto logits = m.forward(rows);
         require(logits.size() == rows.size(), "decode logits row count");
         if (o.mtp) {
-            m.draft_forward(rows, true);
+            m.draft_ingest(rows);
             for (int l : logicals)
                 m.draft_accept(active[l]->physical, m.length(active[l]->physical) - 1);
         }
@@ -659,6 +727,7 @@ class Server {
                 }
                 if (rows.empty())
                     break;
+                ProfileScope profile("hy4.draft");
                 const auto logits = m.draft_forward(rows, false);
                 require(logits.size() == rows.size(), "draft logits row count");
                 for (size_t j = 0; j < which.size(); ++j) {
@@ -694,6 +763,7 @@ class Server {
                     target.push_back(DeviceInput{d.token, lane.physical});
             }
             require(target.size() <= size_t(m.batch()), "verification exceeds native batch");
+            ProfileScope verify_profile("hy4.verify_and_commit");
             const auto logits = m.forward(target);
             require(logits.size() == target.size(), "verification logits row count");
             commands(false);
@@ -738,7 +808,8 @@ class Server {
                 }
                 if (replay.empty())
                     break;
-                m.draft_forward(replay, true);
+                m.draft_ingest(replay);
+                commands(false);
             }
             for (auto &lane : lanes) {
                 auto &a = *active[lane.logical];
@@ -818,14 +889,14 @@ class Server {
     Server(DeviceModel &model, const Geometry &geometry, std::span<const int32_t> end, ServerOptions options,
            ServerTransport transport)
         : m(model), g(geometry), o(options), io(std::move(transport)), eos(end.begin(), end.end()),
-          active(m.slots()), keys(m.slots()), used(m.slots(), 0) {
+          active(m.slots()), keys(m.slots()), prefixes(m.slots()), used(m.slots(), 0) {
         require(m.slots() >= 1 && m.slots() <= m.batch() && m.batch() <= 8,
                 "invalid native slot/batch geometry");
         require(bool(io.read) && bool(io.write), "missing transport");
         if (!o.max_context)
             o.max_context = g.max_context;
         require(o.max_context > 0 && o.max_context <= g.max_context, "invalid max context");
-        require(o.prefill_chunk > 0 && o.prefill_chunk <= m.batch() && o.mtp >= 0 &&
+        require(o.prefill_chunk > 0 && o.prefill_chunk <= m.prefill_batch() && o.mtp >= 0 &&
                     o.mtp <= std::min(5, m.batch() - 1),
                 "invalid prefill/MTP bounds");
         require(!o.mtp || m.has_mtp(), "MTP requested but no native draft layer");
@@ -863,9 +934,15 @@ class Server {
                 auto queued = std::move(pending.front());
                 pending.pop_front();
                 try {
-                    const int logical = admit(queued.first);
-                    if (queued.second && active[logical])
-                        active[logical]->cancel = true;
+                    admit(queued.first, queued.second);
+                } catch (const CapacityWait &wait) {
+                    pending.push_front(std::move(queued));
+                    // The control reader needs progress while existing lanes
+                    // finish. This reports zero newly processed prompt tokens.
+                    if (ms(capacity_progress) >= 1000) {
+                        say("PP 0 " + std::to_string(wait.prompt_tokens) + " 0 0");
+                        capacity_progress = Clock::now();
+                    }
                 } catch (const std::exception &e) {
                     say("ERR " + std::string(e.what()));
                 }

@@ -23,9 +23,12 @@
 // SOFTWARE.
 
 #include "strata/hy4/device_experts.hpp"
+#include "strata/hy4/profile.hpp"
+#include "strata/hy4/offset_arena.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "prefill_gemm.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -234,6 +237,33 @@ __global__ void clamped_swiglu_float(const float *gate, const float *up, float *
     h[i] = __fmul_rn(__fdividef(g, __fadd_rn(1.0f, __expf(-g))), u);
 }
 
+// A prompt routes on the GPU once. Host offload decisions consume only one
+// count per expert; route indices, activation gather and output scatter stay GPU.
+__global__ void count_routes(const int32_t* ids,int32_t* counts,int entries,int used,int experts){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=entries)return;const int e=ids[i];
+    if(e<0||e>=experts){atomicExch(counts+experts,1);return;}
+    for(int k=0;k<i%used;++k)if(ids[i-i%used+k]==e)atomicExch(counts+experts,1);
+    atomicAdd(counts+e,1);
+}
+__global__ void prefix_routes(const int32_t* counts,int32_t* offsets,int32_t* cursor,int32_t* task_expert,int32_t* task_start,int32_t* tasks,int experts){
+    if(threadIdx.x)return;int offset=0,n=0;
+    for(int e=0;e<experts;++e){offsets[e]=cursor[e]=offset;offset+=counts[e];
+        for(int at=0;at<counts[e];at+=16){task_expert[n]=e;task_start[n++]=at;}}
+    offsets[experts]=offset;*tasks=n;
+}
+__global__ void compact_routes(const int32_t* ids,int32_t* cursor,int32_t* indices,int entries,int experts){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<entries){const int e=ids[i];if(e>=0&&e<experts)indices[atomicAdd(cursor+e,1)]=i;}
+}
+__global__ void gather_routes(const float* input,float* output,const int32_t* indices,int count,int width,int used){
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<size_t(count)*width)output[i]=input[size_t(indices[i/width]/used)*width+i%width];
+}
+__global__ void scatter_routes(const float* input,float* output,const int32_t* indices,int count,int width){
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<size_t(count)*width)output[size_t(indices[i/width])*width+i%width]=input[i];
+}
+__global__ void poison_routes(float* output,const int32_t* counts,int experts,size_t n){
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<n&&counts[experts])output[i]=nanf("");
+}
+
 __global__ void weighted_reduce(const float *routes, const float *weights, float *out, int latent, int used,
                                 int rows) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -315,8 +345,11 @@ struct Buffer {
     size_t bytes;
     Buffer(int device, size_t bytes) : device(device), bytes(bytes) {
         DeviceGuard guard(device);
-        if (bytes)
-            ck(cudaMalloc(&ptr, bytes));
+        if (bytes) {
+            size_t available=0,total=0;ck(cudaMemGetInfo(&available,&total));
+            const auto error=cudaMalloc(&ptr,bytes);
+            if(error!=cudaSuccess)throw std::runtime_error("Hy4 experts device="+std::to_string(device)+" cudaMalloc requested="+std::to_string(bytes)+" free="+std::to_string(available)+" total="+std::to_string(total)+": "+cudaGetErrorString(error));
+        }
     }
     ~Buffer() {
         cudaSetDevice(device);
@@ -383,7 +416,7 @@ struct Event {
 struct Layer {
     Tensor gate, up, down;
     size_t gate_bytes = 0, up_bytes = 0, down_bytes = 0, bytes = 0;
-    bool fast = false;
+    bool fast = false,draft=false;
 };
 Layer describe_layer(const Geometry &g, const ExpertExecutor::Lookup &lookup, int layer) {
     const auto name = [&](const char *suffix) { return "blk." + std::to_string(layer) + "." + suffix; };
@@ -410,6 +443,7 @@ Layer describe_layer(const Geometry &g, const ExpertExecutor::Lookup &lookup, in
     l.fast = (l.gate.info->type == 12 && l.up.info->type == 12 &&
               (l.down.info->type == 12 || l.down.info->type == 14)) ||
              (floating(l.gate.info->type) && floating(l.up.info->type) && floating(l.down.info->type));
+    l.draft=layer>=g.layers;
     return l;
 }
 
@@ -433,8 +467,9 @@ void copy_device(void *dst, int destination, const void *src, int source, size_t
 }
 void linear_device(uint32_t type, const uint8_t *weights, const float *x, const void *q, float *y, int n_in,
                    int n_out, int rows, cudaStream_t stream) {
-    if (native_mmvq_supported(type))
-        native_mmvq(type, weights, q, y, n_in, n_out, rows, stream);
+    if (native_mmvq_supported(type)) {
+        for(int at=0;at<rows;at+=8)native_mmvq(type,weights,static_cast<const uint8_t*>(q)+size_t(at)*(n_in/32)*sizeof(Q81Block),y+size_t(at)*n_out,n_in,n_out,std::min(8,rows-at),stream);
+    }
     else
         floating_mmv<<<dim3((n_out + 3) / 4, rows), 128, 0, stream>>>(weights, x, y, type, n_in, n_out);
     ck(cudaGetLastError());
@@ -461,8 +496,8 @@ void launch_routed_type(const unsigned long long *table, const int32_t *ids, con
 
 ExpertMemory ExpertExecutor::memory_requirements(const Geometry &g, const Lookup &lookup, int max_rows,
                                                  int lanes) {
-    if (max_rows < 1 || max_rows > 8 || lanes < 1 || lanes > 16)
-        throw std::runtime_error("Hy4 experts: rows must be 1..8 and lanes 1..16");
+    if (max_rows < 1 || max_rows > 512 || lanes < 1 || lanes > 16)
+        throw std::runtime_error("Hy4 experts: rows must be 1..512 and lanes 1..16");
     const size_t blob = max_blob(g, lookup), rows = max_rows, entries = rows * g.used;
     const size_t latent = rows * g.latent * sizeof(float), ff = rows * g.ff * sizeof(float);
     const size_t xq = rows * (g.latent / 32) * sizeof(Q81Block), hq = rows * (g.ff / 32) * sizeof(Q81Block);
@@ -471,18 +506,25 @@ ExpertMemory ExpertExecutor::memory_requirements(const Geometry &g, const Lookup
     const size_t full_hq = entries * (g.ff / 32) * sizeof(Q81Block);
     const size_t ids = entries * sizeof(int32_t), weights = entries * sizeof(float);
     const size_t tables = size_t(g.layers + g.draft_layers) * g.experts * sizeof(unsigned long long);
-    return {size_t(lanes) * lane + routes + 3 * full_ff + full_hq + xq + 2 * latent + ids + weights + tables,
-            size_t(lanes) * blob + ids};
+    const size_t tasks=(entries+15*size_t(g.experts))/16;
+    const size_t metadata=max_rows>8?(3*size_t(g.experts)+entries+2*tasks+3)*sizeof(int32_t):0;
+    const size_t host_metadata=max_rows>8?size_t(g.experts+1)*sizeof(int32_t):0;
+    return {size_t(lanes) * lane + routes + 3 * full_ff + full_hq + xq + 2 * latent + ids + weights + tables+metadata,
+            size_t(lanes) * blob + ids+host_metadata};
 }
 
 struct ExpertExecutor::Impl {
     using Key = uint64_t;
+    struct View {
+        void* ptr;size_t bytes,offset;
+        template<class T>T* as()const{return static_cast<T*>(ptr);}
+    };
     struct Entry {
-        Buffer weights;
-        Event ready, last_use;
+        View weights;size_t charge;
+        Event* last_use=nullptr; // fixed Lane retirement event, never owns CUDA memory
         bool pinned = false;
         std::list<Key>::iterator lru;
-        Entry(int device, size_t bytes) : weights(device, bytes), ready(device), last_use(device) {}
+        Entry(void* ptr,size_t bytes,size_t offset,size_t charge):weights{ptr,bytes,offset},charge(charge){}
     };
     struct Lane {
         Stream copy, compute;
@@ -492,7 +534,7 @@ struct ExpertExecutor::Impl {
         bool touched = false;
         Lane(int device, size_t blob, const Geometry &g, int rows)
             : copy(device), compute(device), staging(blob), transient(device, blob),
-              input(device, size_t(rows) * g.latent * 4), xq(device, native_q8_1_bytes(g.latent, rows)),
+              input(device, size_t(rows) * g.latent * 4), xq(device, size_t(rows)*(g.latent/32)*sizeof(Q81Block)),
               gate(device, size_t(rows) * g.ff * 4), up(device, size_t(rows) * g.ff * 4),
               hidden(device, size_t(rows) * g.ff * 4),
               hq(device, size_t(rows) * (g.ff / 32) * sizeof(Q81Block)),
@@ -501,12 +543,14 @@ struct ExpertExecutor::Impl {
     };
     struct Card {
         int device;
-        size_t capacity, used = 0, pinned = 0, fixed;
+        size_t capacity, used = 0, pinned = 0, fixed,observed_driver_bytes=0;
         Stream fast;
         Event input_ready, fast_done, final_done;
-        HostBuffer host_ids;
+        HostBuffer host_ids,host_counts;
         Buffer routes, fast_gate, fast_up, fast_hidden, fast_hq, fast_xq, fast_input, fast_ids, fast_weights,
-            fast_out, tables;
+            fast_out, tables,route_counts,route_offsets,route_cursor,route_indices,task_expert,task_start,task_count;
+        std::unique_ptr<Buffer> arena;
+        std::unique_ptr<OffsetArena> arena_map;
         std::vector<std::unique_ptr<Lane>> lanes;
         std::list<Key> lru;
         std::unordered_map<Key, std::unique_ptr<Entry>> cache;
@@ -515,22 +559,31 @@ struct ExpertExecutor::Impl {
              ExpertMemory memory)
             : device(config.device), capacity(config.resident_bytes), fixed(memory.device_workspace),
               fast(device), input_ready(device), fast_done(device), final_done(device),
-              host_ids(size_t(rows) * g.used * sizeof(int32_t)),
+              host_ids(size_t(rows) * g.used * sizeof(int32_t)),host_counts(rows>8?size_t(g.experts+1)*4:0),
               routes(device, size_t(rows) * g.used * g.latent * 4),
               fast_gate(device, size_t(rows) * g.used * g.ff * 4),
               fast_up(device, size_t(rows) * g.used * g.ff * 4),
               fast_hidden(device, size_t(rows) * g.used * g.ff * 4),
               fast_hq(device, size_t(rows) * g.used * (g.ff / 32) * sizeof(Q81Block)),
-              fast_xq(device, native_q8_1_bytes(g.latent, rows)),
+              fast_xq(device, size_t(rows)*(g.latent/32)*sizeof(Q81Block)),
               fast_input(device, size_t(rows) * g.latent * 4),
               fast_ids(device, size_t(rows) * g.used * sizeof(int32_t)),
               fast_weights(device, size_t(rows) * g.used * 4), fast_out(device, size_t(rows) * g.latent * 4),
-              tables(device, size_t(g.layers + g.draft_layers) * g.experts * sizeof(unsigned long long)) {
+              tables(device, size_t(g.layers + g.draft_layers) * g.experts * sizeof(unsigned long long)),
+              route_counts(device,rows>8?size_t(g.experts+1)*4:0),route_offsets(device,rows>8?size_t(g.experts+1)*4:0),
+              route_cursor(device,rows>8?size_t(g.experts)*4:0),route_indices(device,rows>8?size_t(rows)*g.used*4:0),
+              task_expert(device,rows>8?((size_t(rows)*g.used+15*size_t(g.experts))/16)*4:0),
+              task_start(device,rows>8?((size_t(rows)*g.used+15*size_t(g.experts))/16)*4:0),task_count(device,rows>8?4:0) {
             DeviceGuard guard(device);
             for (int i = 0; i < n_lanes; ++i)
                 lanes.push_back(std::make_unique<Lane>(device, blob, g, rows));
             ck(cudaMemsetAsync(tables.ptr, 0, tables.bytes, fast.value));
             ck(cudaStreamSynchronize(fast.value));
+            size_t available=0,total=0;ck(cudaMemGetInfo(&available,&total));
+            if(config.elastic)capacity=std::min(capacity,available)&~((size_t(2)<<20)-1);
+            if(capacity>available)throw std::runtime_error("Hy4 expert arena device="+std::to_string(device)+" requested="+std::to_string(capacity)+" free_after_workspace="+std::to_string(available));
+            arena=std::make_unique<Buffer>(device,capacity);
+            arena_map=std::make_unique<OffsetArena>(capacity);
         }
         ~Card() {
             cudaSetDevice(device);
@@ -577,10 +630,11 @@ struct ExpertExecutor::Impl {
             size_t available, total;
             ck(cudaMemGetInfo(&available, &total));
             if (memory.device_workspace > available ||
-                config.resident_bytes > available - memory.device_workspace)
-                throw std::runtime_error("Hy4 experts: resident capacity plus workspace exceeds free VRAM");
+                (!config.elastic&&config.resident_bytes > available - memory.device_workspace))
+                throw std::runtime_error("Hy4 experts device="+std::to_string(config.device)+" requested_cache="+std::to_string(config.resident_bytes)+" workspace="+std::to_string(memory.device_workspace)+" free="+std::to_string(available));
             card_index[config.device] = cards.size();
             cards.push_back(std::make_unique<Card>(config, g, max_bytes, rows, lanes, memory));
+            size_t after=0;ck(cudaMemGetInfo(&after,&total));cards.back()->observed_driver_bytes=available>=after?available-after:0;
         }
         for (auto &dst : cards)
             for (auto &src : cards)
@@ -630,62 +684,43 @@ struct ExpertExecutor::Impl {
         c.lru.splice(c.lru.begin(), c.lru, at->second->lru);
         return at->second.get();
     }
+    void evict(Card& c,std::list<Key>::iterator victim){
+        auto& entry=*c.cache.at(*victim);if(entry.pinned)throw std::runtime_error("Hy4 arena attempted pinned eviction");
+        if(entry.last_use)entry.last_use->sync();
+        c.arena_map->release(entry.weights.offset,entry.weights.bytes);c.used-=entry.charge;
+        const Key old=*victim;c.lru.erase(victim);c.cache.erase(old);++counters.evictions;
+    }
     Entry *admit(Card &c, Key k, size_t bytes, bool pin) {
-        if (auto *existing = find(c, k)) {
-            if (pin && !existing->pinned) {
-                existing->pinned = true;
-                c.pinned += bytes;
-            }
-            return existing;
-        }
-        if (bytes > c.capacity - c.pinned)
-            return nullptr;
-        while (bytes > c.capacity - c.used) {
-            auto victim = c.lru.end();
-            while (victim != c.lru.begin()) {
-                --victim;
-                if (!c.cache.at(*victim)->pinned)
-                    break;
-            }
-            if (victim == c.lru.end() || c.cache.at(*victim)->pinned)
-                return nullptr;
-            auto &entry = *c.cache.at(*victim);
-            entry.last_use.sync();
-            entry.ready.sync();
-            c.used -= entry.weights.bytes;
-            const Key old = *victim;
-            c.lru.erase(victim);
-            c.cache.erase(old);
-            ++counters.evictions;
-        }
-        auto entry = std::make_unique<Entry>(c.device, bytes);
-        entry->pinned = pin;
-        c.lru.push_front(k);
-        entry->lru = c.lru.begin();
-        c.used += bytes;
-        if (pin)
-            c.pinned += bytes;
-        auto *result = entry.get();
-        c.cache.emplace(k, std::move(entry));
-        return result;
+        if(auto* existing=find(c,k)){if(pin&&!existing->pinned){existing->pinned=true;c.pinned+=existing->charge;}return existing;}
+        const size_t charge=c.arena_map->allocation_bytes(bytes);
+        if(charge>c.capacity-c.pinned)return nullptr;
+        auto offset=c.arena_map->allocate(bytes);
+        while(!offset){auto victim=c.lru.end();while(victim!=c.lru.begin()){--victim;if(!c.cache.at(*victim)->pinned)break;}
+            if(victim==c.lru.end()||c.cache.at(*victim)->pinned)return nullptr;
+            evict(c,victim);offset=c.arena_map->allocate(bytes);}
+        auto entry=std::make_unique<Entry>(c.arena->as<uint8_t>()+*offset,bytes,*offset,charge);
+        entry->pinned=pin;c.lru.push_front(k);entry->lru=c.lru.begin();c.used+=charge;if(pin)c.pinned+=charge;
+        auto* result=entry.get();c.cache.emplace(k,std::move(entry));return result;
     }
     void upload(Card &c, Lane &lane, const Layer &l, int expert, void *destination, Entry *entry) {
+        ProfileScope profile("hy4.experts.upload");
         // Reuse neither a host staging buffer still read by DMA nor a transient slot
         // still consumed by a previous expert. Copies overlap the other lane's compute.
-        lane.uploaded.sync();
-        if (!entry)
-            lane.weights_used.wait(lane.copy.value);
+        { ProfileScope phase("hy4.experts.upload.prior_event"); lane.uploaded.sync(); }
+        { ProfileScope phase("hy4.experts.upload.weights_dependency");
+          if (!entry) lane.weights_used.wait(lane.copy.value); }
         auto *host = lane.staging.as<uint8_t>();
-        std::memcpy(host, l.gate.data + size_t(expert) * l.gate_bytes, l.gate_bytes);
-        std::memcpy(host + l.gate_bytes, l.up.data + size_t(expert) * l.up_bytes, l.up_bytes);
-        std::memcpy(host + l.gate_bytes + l.up_bytes, l.down.data + size_t(expert) * l.down_bytes,
-                    l.down_bytes);
-        ck(cudaMemcpyAsync(destination, host, l.bytes, cudaMemcpyHostToDevice, lane.copy.value));
-        lane.uploaded.record(lane.copy.value);
-        if (entry)
-            entry->ready.record(lane.copy.value);
+        { ProfileScope phase("hy4.experts.upload.host_copy");
+          std::memcpy(host, l.gate.data + size_t(expert) * l.gate_bytes, l.gate_bytes);
+          std::memcpy(host + l.gate_bytes, l.up.data + size_t(expert) * l.up_bytes, l.up_bytes);
+          std::memcpy(host + l.gate_bytes + l.up_bytes, l.down.data + size_t(expert) * l.down_bytes,
+                      l.down_bytes); }
+        { ProfileScope phase("hy4.experts.upload.h2d_enqueue");
+          ck(cudaMemcpyAsync(destination, host, l.bytes, cudaMemcpyHostToDevice, lane.copy.value)); }
+        { ProfileScope phase("hy4.experts.upload.record"); lane.uploaded.record(lane.copy.value); }
         ++counters.uploads;
         counters.uploaded_bytes += l.bytes;
+        if(l.draft)counters.draft_uploaded_bytes+=l.bytes;else counters.target_uploaded_bytes+=l.bytes;
     }
     Card &select_card(int layer, int expert) {
         if (auto at = full_layers.find(layer); at != full_layers.end())
@@ -695,6 +730,73 @@ struct ExpertExecutor::Impl {
             if (card->cache.contains(k))
                 return *card;
         return *cards[(size_t(layer) * 131u + size_t(expert)) % cards.size()];
+    }
+
+    void prepare_routes(Card& primary,const int32_t* ids,int rows,cudaStream_t stream){
+        ck(cudaMemsetAsync(primary.route_counts.ptr,0,primary.route_counts.bytes,stream));
+        const int entries=rows*g.used;
+        count_routes<<<(entries+255)/256,256,0,stream>>>(ids,primary.route_counts.as<int32_t>(),entries,g.used,g.experts);
+        prefix_routes<<<1,32,0,stream>>>(primary.route_counts.as<int32_t>(),primary.route_offsets.as<int32_t>(),primary.route_cursor.as<int32_t>(),primary.task_expert.as<int32_t>(),primary.task_start.as<int32_t>(),primary.task_count.as<int32_t>(),g.experts);
+        compact_routes<<<(entries+255)/256,256,0,stream>>>(ids,primary.route_cursor.as<int32_t>(),primary.route_indices.as<int32_t>(),entries,g.experts);ck(cudaGetLastError());
+    }
+    bool tc_layer(const Layer& layer)const{return prefill_detail::supported(layer.gate.info->type)&&prefill_detail::supported(layer.up.info->type)&&prefill_detail::supported(layer.down.info->type);}
+    void run_wide_resident(int layer,Card& primary,Card& owner,const float* latent,const int32_t* ids,const float* weights,float* out,int rows,cudaStream_t caller){
+        ProfileScope profile("hy4.experts.prefill_resident");
+        const auto& l=layers[layer];primary.input_ready.record(caller);DeviceGuard guard(owner.device);const auto stream=owner.fast.value;primary.input_ready.wait(stream);
+        const float* x=latent;const float* scale=weights;const int32_t* selected=ids;
+        if(owner.device!=primary.device){
+            copy_device(owner.fast_input.ptr,owner.device,latent,primary.device,size_t(rows)*g.latent*4,stream);
+            copy_device(owner.fast_ids.ptr,owner.device,ids,primary.device,size_t(rows)*g.used*4,stream);
+            copy_device(owner.fast_weights.ptr,owner.device,weights,primary.device,size_t(rows)*g.used*4,stream);
+            x=owner.fast_input.as<float>();selected=owner.fast_ids.as<int32_t>();scale=owner.fast_weights.as<float>();
+        }
+        prepare_routes(owner,selected,rows,stream);
+        const auto* table=owner.tables.as<unsigned long long>()+size_t(layer)*g.experts;
+        const int tasks=int(owner.task_expert.bytes/4),entries=rows*g.used;
+        const auto* offsets=owner.route_offsets.as<int32_t>();const auto* counts=owner.route_counts.as<int32_t>();const auto* indices=owner.route_indices.as<int32_t>();
+        prefill_detail::grouped(l.gate.info->type,l.up.info->type,nullptr,table,x,owner.fast_gate.as<float>(),owner.fast_up.as<float>(),g.latent,g.ff,rows,offsets,counts,indices,owner.task_expert.as<int32_t>(),owner.task_start.as<int32_t>(),owner.task_count.as<int32_t>(),tasks,0,0,g.used,false,false,0,l.gate_bytes,stream);
+        const size_t n=size_t(entries)*g.ff;
+        clamped_swiglu_float<<<unsigned((n+255)/256),256,0,stream>>>(owner.fast_gate.as<float>(),owner.fast_up.as<float>(),owner.fast_hidden.as<float>(),n,g.clamp.at(layer));
+        prefill_detail::grouped(l.down.info->type,l.down.info->type,nullptr,table,owner.fast_hidden.as<float>(),owner.routes.as<float>(),nullptr,g.ff,g.latent,rows,offsets,counts,indices,owner.task_expert.as<int32_t>(),owner.task_start.as<int32_t>(),owner.task_count.as<int32_t>(),tasks,0,0,g.used,true,false,l.gate_bytes+l.up_bytes,0,stream);
+        float* destination=owner.device==primary.device?out:owner.fast_out.as<float>();
+        weighted_reduce<<<(rows*g.latent+255)/256,256,0,stream>>>(owner.routes.as<float>(),scale,destination,g.latent,g.used,rows);
+        poison_routes<<<(rows*g.latent+255)/256,256,0,stream>>>(destination,counts,g.experts,size_t(rows)*g.latent);ck(cudaGetLastError());
+        if(owner.device!=primary.device)copy_device(out,primary.device,destination,owner.device,size_t(rows)*g.latent*4,stream);
+        owner.fast_done.record(stream);
+        {DeviceGuard primary_guard(primary.device);owner.fast_done.wait(caller);primary.final_done.record(caller);}
+        counters.routed_entries+=entries;counters.hits+=entries;++counters.resident_calls;
+    }
+    void run_wide_streamed(int layer,Card& primary,const float* latent,const float* weights,float* out,int rows,cudaStream_t caller){
+        ProfileScope profile("hy4.experts.prefill_streamed");
+        ck(cudaMemcpyAsync(primary.host_counts.ptr,primary.route_counts.ptr,primary.route_counts.bytes,cudaMemcpyDeviceToHost,caller));ck(cudaStreamSynchronize(caller));++counters.metadata_readbacks;
+        const auto* counts=primary.host_counts.as<int32_t>();if(counts[g.experts])throw std::runtime_error("Hy4 prefill route IDs invalid or duplicated");
+        const auto& l=layers[layer];counters.routed_entries+=uint64_t(rows)*g.used;
+        for(auto& card:cards)for(auto& lane:card->lanes)lane->touched=false;
+        int offset=0;
+        for(int expert=0;expert<g.experts;++expert){const int n=counts[expert];if(!n)continue;++counters.unique_experts;
+            Card& card=select_card(layer,expert);DeviceGuard guard(card.device);Lane& lane=*card.lanes[card.next_lane++%card.lanes.size()];lane.touched=true;
+            Entry* entry=find(card,key(layer,expert));const bool hit=entry!=nullptr;if(entry)counters.hits+=n;else{counters.misses+=n;entry=admit(card,key(layer,expert),l.bytes,false);upload(card,lane,l,expert,entry?entry->weights.ptr:lane.transient.ptr,entry);}
+            if(!hit)lane.uploaded.wait(lane.compute.value);const auto stream=lane.compute.value;
+            const auto* blob=entry?entry->weights.as<uint8_t>():lane.transient.as<uint8_t>();
+            const auto* indices=primary.route_indices.as<int32_t>()+offset;
+            if(tc_layer(l)){
+                prefill_detail::grouped(l.gate.info->type,l.up.info->type,blob,nullptr,latent,lane.gate.as<float>(),lane.up.as<float>(),g.latent,g.ff,n,nullptr,nullptr,indices,nullptr,nullptr,nullptr,0,0,n,g.used,false,true,0,l.gate_bytes,stream);
+                clamped_swiglu_float<<<(size_t(n)*g.ff+255)/256,256,0,stream>>>(lane.gate.as<float>(),lane.up.as<float>(),lane.hidden.as<float>(),size_t(n)*g.ff,g.clamp.at(layer));
+                prefill_detail::grouped(l.down.info->type,l.down.info->type,blob,nullptr,lane.hidden.as<float>(),lane.down.as<float>(),nullptr,g.ff,g.latent,n,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,0,0,n,1,false,true,l.gate_bytes+l.up_bytes,0,stream);
+            }else{
+                gather_routes<<<(size_t(n)*g.latent+255)/256,256,0,stream>>>(latent,lane.input.as<float>(),indices,n,g.latent,g.used);
+                for(int at=0;at<n;at+=8)native_quantize_q8_1(lane.input.as<float>()+size_t(at)*g.latent,lane.xq.as<Q81Block>()+size_t(at)*(g.latent/32),g.latent,std::min(8,n-at),stream);
+                linear_device(l.gate.info->type,blob,lane.input.as<float>(),lane.xq.ptr,lane.gate.as<float>(),g.latent,g.ff,n,stream);
+                linear_device(l.up.info->type,blob+l.gate_bytes,lane.input.as<float>(),lane.xq.ptr,lane.up.as<float>(),g.latent,g.ff,n,stream);
+                if(native_mmvq_supported(l.down.info->type))clamped_swiglu_quant<<<(size_t(n)*g.ff+255)/256,256,0,stream>>>(lane.gate.as<float>(),lane.up.as<float>(),lane.hq.as<Q81Block>(),size_t(n)*g.ff,g.clamp.at(layer));
+                else clamped_swiglu_float<<<(size_t(n)*g.ff+255)/256,256,0,stream>>>(lane.gate.as<float>(),lane.up.as<float>(),lane.hidden.as<float>(),size_t(n)*g.ff,g.clamp.at(layer));
+                linear_device(l.down.info->type,blob+l.gate_bytes+l.up_bytes,lane.hidden.as<float>(),lane.hq.ptr,lane.down.as<float>(),g.ff,g.latent,n,stream);
+            }
+            lane.weights_used.record(stream);if(entry)entry->last_use=&lane.weights_used;
+            scatter_routes<<<(size_t(n)*g.latent+255)/256,256,0,stream>>>(lane.down.as<float>(),primary.routes.as<float>(),indices,n,g.latent);ck(cudaGetLastError());lane.finished.record(stream);offset+=n;
+        }
+        DeviceGuard guard(primary.device);for(auto& card:cards)for(auto& lane:card->lanes)if(lane->touched)lane->finished.wait(caller);
+        weighted_reduce<<<(rows*g.latent+255)/256,256,0,caller>>>(primary.routes.as<float>(),weights,out,g.latent,g.used,rows);ck(cudaGetLastError());primary.final_done.record(caller);
     }
 
     void run_resident(int layer, Card &primary, Card &owner, const float *latent, const int32_t *ids,
@@ -782,6 +884,11 @@ struct ExpertExecutor::Impl {
             cards[previous_output_card]->final_done.wait(caller);
         previous_output_card = int(at->second);
         ++counters.calls;
+        if(rows>8){
+            if(auto full=full_layers.find(layer);full!=full_layers.end()&&tc_layer(layers[layer]))run_wide_resident(layer,primary,*cards[full->second],latent,ids,weights,out,rows,caller);
+            else {prepare_routes(primary,ids,rows,caller);run_wide_streamed(layer,primary,latent,weights,out,rows,caller);}
+            return;
+        }
         if (auto full = full_layers.find(layer); full != full_layers.end() && layers[layer].fast) {
             run_resident(layer, primary, *cards[full->second], latent, ids, weights, out, rows, caller);
             return;
@@ -821,6 +928,7 @@ struct ExpertExecutor::Impl {
             Lane &lane = *card.lanes[card.next_lane++ % card.lanes.size()];
             lane.touched = true;
             Entry *entry = find(card, key(layer, expert));
+            const bool hit=entry!=nullptr;
             if (entry)
                 counters.hits += positions.size();
             else {
@@ -828,9 +936,7 @@ struct ExpertExecutor::Impl {
                 entry = admit(card, key(layer, expert), l.bytes, false);
                 upload(card, lane, l, expert, entry ? entry->weights.ptr : lane.transient.ptr, entry);
             }
-            if (entry)
-                entry->ready.wait(lane.compute.value);
-            else
+            if (!hit)
                 lane.uploaded.wait(lane.compute.value);
             const auto stream = lane.compute.value;
             for (size_t i = 0; i < positions.size(); ++i)
@@ -856,10 +962,8 @@ struct ExpertExecutor::Impl {
             ck(cudaGetLastError());
             linear_device(l.down.info->type, blob + l.gate_bytes + l.up_bytes, lane.hidden.as<float>(),
                           lane.hq.ptr, lane.down.as<float>(), g.ff, g.latent, n, stream);
-            if (entry)
-                entry->last_use.record(stream);
-            else
-                lane.weights_used.record(stream);
+            lane.weights_used.record(stream);
+            if (entry)entry->last_use=&lane.weights_used;
             for (size_t i = 0; i < positions.size(); ++i) {
                 const size_t index = size_t(positions[i].row) * g.used + positions[i].slot;
                 copy_device(primary.routes.as<float>() + index * g.latent, input_device,
@@ -884,7 +988,8 @@ struct ExpertExecutor::Impl {
             return device < 0 || cards[existing->second]->device == device;
         synchronize_all();
         const auto &l = layers[layer];
-        const size_t layer_bytes = l.bytes * g.experts;
+        const size_t charge=cards.front()->arena_map->allocation_bytes(l.bytes);
+        const size_t layer_bytes = charge * g.experts;
         size_t chosen = 0;
         if (device >= 0) {
             auto at = card_index.find(device);
@@ -899,10 +1004,11 @@ struct ExpertExecutor::Impl {
         size_t pinned_here = 0;
         for (int expert = 0; expert < g.experts; ++expert)
             if (auto at = card.cache.find(key(layer, expert)); at != card.cache.end() && at->second->pinned)
-                pinned_here += l.bytes;
+                pinned_here += at->second->charge;
         if (layer_bytes > card.capacity - (card.pinned - pinned_here))
             return false;
         DeviceGuard guard(card.device);
+        for(auto it=card.lru.begin();it!=card.lru.end();){auto current=it++;if(!card.cache.at(*current)->pinned)evict(card,current);}
         std::vector<unsigned long long> pointers(g.experts);
         for (int expert = 0; expert < g.experts; ++expert) {
             const Key k = key(layer, expert);
@@ -914,8 +1020,8 @@ struct ExpertExecutor::Impl {
             if (!existed) {
                 auto &lane = *card.lanes[card.next_lane++ % card.lanes.size()];
                 upload(card, lane, l, expert, entry->weights.ptr, entry);
+                lane.uploaded.wait(card.fast.value);
             }
-            entry->ready.wait(card.fast.value);
             pointers[expert] = reinterpret_cast<unsigned long long>(entry->weights.ptr);
         }
         ck(cudaMemcpyAsync(card.tables.as<unsigned long long>() + size_t(layer) * g.experts, pointers.data(),
@@ -964,15 +1070,19 @@ size_t ExpertExecutor::reserved_bytes(int device) const {
     if (at == impl_->card_index.end())
         throw std::runtime_error("Hy4 experts: unknown device");
     const auto &card = *impl_->cards[at->second];
-    return card.fixed + card.used;
+    return card.fixed + card.arena->bytes;
 }
 ExpertCacheStats ExpertExecutor::stats() const {
     std::lock_guard lock(impl_->mutex);
     auto result = impl_->counters;
+    result.pinned_layers=impl_->full_layers.size();
     for (const auto &card : impl_->cards) {
         result.cache_bytes += card->used;
         result.cache_capacity += card->capacity;
         result.pinned_bytes += card->pinned;
+        result.arena_bytes += card->arena->bytes;
+        result.observed_driver_bytes += card->observed_driver_bytes;
+        for(const auto& [_,entry]:card->cache){result.resident_weight_bytes+=entry->weights.bytes;if(entry->pinned)result.pinned_weight_bytes+=entry->weights.bytes;}
     }
     return result;
 }

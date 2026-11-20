@@ -166,7 +166,7 @@ def install(S, a, *, gpu=None, multi=None, hip=False, port=8080):
                        4 if getattr(a, "threads", None) is None else a.threads,
                        ",".join(str(i) for i in range(len(devices))) if devices else None,
                        slots=slots, context_pool=pool,
-                       prefill_chunk=8 if getattr(a, "prefill_chunk", None) is None else a.prefill_chunk,
+                       prefill_chunk=getattr(a, "prefill_chunk", None),
                        mmproj=folder / hy4.PROJECTOR if vision else None,
                        mtp=mtp, native_caps=caps, vision_gpu=vision_word == "gpu",
                        vram_reserve_mib=getattr(a, "vram_reserve_mib", None))

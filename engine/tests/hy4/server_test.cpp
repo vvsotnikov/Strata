@@ -27,11 +27,43 @@ struct Seen {
     Vec embedding;
 };
 struct Synthetic final : DeviceModel {
+    struct Snapshot {
+        std::vector<int32_t> history, draft;
+        bool carry = false, valid = false;
+        uint64_t draft_state = 0;
+    };
     std::array<std::vector<int32_t>, 4> histories, drafts;
     std::array<bool, 4> carry_valid{};
+    std::array<Snapshot, 4> snapshots;
+    std::array<uint64_t, 4> draft_states{};
+    bool snapshots_enabled = false, fail_restore = false, check_draft_state = false;
+    size_t checkpoints = 0, restore_attempts = 0, restored = 0;
+    static uint64_t state_of(std::span<const int32_t> tokens) {
+        uint64_t state = 0;
+        for (int token : tokens) state = state * 31 + uint64_t(token + 1);
+        return state;
+    }
+    bool checkpoint(int slot) override {
+        if (!snapshots_enabled) return false;
+        snapshots.at(slot) = {histories.at(slot), drafts.at(slot), carry_valid.at(slot), true, draft_states.at(slot)};
+        ++checkpoints;
+        return true;
+    }
+    bool restore_checkpoint(int slot, size_t n) override {
+        ++restore_attempts;
+        const auto &saved = snapshots.at(slot);
+        if (fail_restore || !saved.valid || saved.history.size() != n) return false;
+        histories.at(slot) = saved.history;
+        drafts.at(slot) = saved.draft;
+        carry_valid.at(slot) = saved.carry;
+        draft_states.at(slot) = saved.draft_state;
+        ++restored;
+        return true;
+    }
     bool disagree_once = false;
     size_t provisional = 0;
     std::vector<Seen> seen;
+    int prefill_limit = 8;
     size_t capacity = 512, largest_batch = 0, draft_calls = 0, target_replays = 0, accepted_features = 0;
     bool mtp = false, cross_slot_tile = false, slow = false;
     size_t forwards = 0;
@@ -45,7 +77,7 @@ struct Synthetic final : DeviceModel {
     std::vector<Vec> forward(std::span<const DeviceInput> inputs, const Trace & = {}) override {
         if (slow)
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        check(inputs.size() <= 8, "scheduler exceeded native tile capacity");
+        check(inputs.size() <= size_t(prefill_limit), "scheduler exceeded native tile capacity");
         check(inputs.size() <= free_tokens(), "unified pool exhausted");
         for (const auto &in : inputs)
             check(in.slot >= 0 && in.slot < 4 && in.token >= 0 && in.token < 8, "invalid device input");
@@ -69,6 +101,8 @@ struct Synthetic final : DeviceModel {
         histories.at(slot).clear();
         drafts.at(slot).clear();
         carry_valid.at(slot) = false;
+        snapshots.at(slot) = {};
+        draft_states.at(slot) = 0;
     }
     void truncate(int slot, size_t n) override {
         check(n <= histories.at(slot).size(), "invalid target truncation");
@@ -79,6 +113,7 @@ struct Synthetic final : DeviceModel {
     std::span<const int32_t> history(int slot) const override { return histories.at(slot); }
     int slots() const override { return 4; }
     int batch() const override { return 8; }
+    int prefill_batch() const override { return prefill_limit; }
     size_t free_tokens() const override {
         size_t used = 0;
         for (const auto &h : histories)
@@ -94,8 +129,11 @@ struct Synthetic final : DeviceModel {
             ++target_replays;
         std::vector<Vec> out;
         for (const auto &in : inputs) {
+            if (check_draft_state)
+                check(draft_states.at(in.slot) == state_of(drafts.at(in.slot)), "MTP checkpoint restored tokens without recurrent draft state");
             check(target_features || carry_valid.at(in.slot), "proposer used invalidated target feature carry after " + std::to_string(forwards) + " target calls and " + std::to_string(accepted_features) + " accepted feature restores");
             drafts.at(in.slot).push_back(in.token);
+            draft_states.at(in.slot) = state_of(drafts.at(in.slot));
             const bool disagree = !target_features && disagree_once && ++provisional == 1;
             out.push_back(logits(disagree ? (in.token + 2) % 8 : in.token));
             carry_valid.at(in.slot) = true;
@@ -107,8 +145,10 @@ struct Synthetic final : DeviceModel {
     size_t draft_length(int slot) const override { return drafts.at(slot).size(); }
     void draft_truncate(int slot, size_t n) override {
         check(n <= drafts.at(slot).size(), "invalid draft truncation");
-        if (n != drafts.at(slot).size()) carry_valid.at(slot) = false;
+        const bool changed = n != drafts.at(slot).size();
+        if (changed) carry_valid.at(slot) = false;
         drafts.at(slot).resize(n);
+        if (changed) draft_states.at(slot) = state_of(drafts.at(slot));
     }
     void draft_accept(int slot, size_t) override { ++accepted_features; carry_valid.at(slot) = true; }
 };
@@ -169,10 +209,10 @@ Geometry geometry() {
     g.max_context = 128;
     return g;
 }
-void run(Synthetic &model, Harness &h, int mtp = 0, bool vision = false) {
+void run(Synthetic &model, Harness &h, int mtp = 0, bool vision = false, int prefill = 8) {
     ServerOptions o;
     o.mtp = mtp;
-    o.prefill_chunk = 8;
+    o.prefill_chunk = prefill;
     o.max_context = 128;
     o.vision = vision;
     o.image_pad = 7;
@@ -204,6 +244,99 @@ void single_and_cache() {
           "solo completion is not delimited");
     check(h.contains("RESUME 1"), "second prompt did not reuse its held prefix");
     check(!h.contains("ERR "), "solo request failed");
+}
+void full_prompt_checkpoint_skips_prefill_and_restores_mtp() {
+    for (bool mtp : {false, true}) {
+        Synthetic model;
+        model.snapshots_enabled = true;
+        model.mtp = mtp;
+        model.check_draft_state = mtp;
+        Harness h;
+        h.input = {"GEN 4 temperature=0 0,1"};
+        bool second = false, first_cached_token = false;
+        size_t before = 0;
+        h.after_write = [&](const std::string &line) {
+            if (!second && line.starts_with("DONE ")) {
+                second = true;
+                before = model.seen.size();
+                h.input.push_back("GEN 4 temperature=0 0,1");
+            } else if (second && !first_cached_token && line.starts_with("T ")) {
+                first_cached_token = true;
+                check(model.seen.size() == before, "full checkpoint recomputed prompt before its first token");
+                if (mtp) check(model.draft_states[0] == Synthetic::state_of(model.drafts[0]), "restored MTP state disagrees with prompt history");
+            }
+        };
+        run(model, h, mtp ? 2 : 0);
+        check(!h.contains("ERR "), "full prompt checkpoint request failed");
+        check(first_cached_token && h.contains("RESUME 2"), "full prompt checkpoint was not reused");
+        check(model.checkpoints == 1 && model.restored == 1, "snapshot was not saved/restored exactly once");
+        check(h.tokens() == std::vector<int>({2,3,4,5,2,3,4,5}), "checkpoint changed generated outputs");
+        if (mtp) check(model.target_replays > 0 && model.draft_calls > 2, "checkpoint case did not exercise MTP generation");
+    }
+}
+void checkpoint_opt_out_does_not_read_or_save_cache() {
+    Synthetic model; model.snapshots_enabled = true;
+    Harness h; h.input = {"GEN 1 temperature=0 1,2"};
+    int completed = 0;
+    h.after_write = [&](const std::string &line) {
+        if (line.starts_with("DONE ") && ++completed < 3)
+            h.input.push_back("GEN 1 temperature=0 ckpt=0 1,2");
+    };
+    run(model,h);
+    check(!h.contains("ERR ") && completed == 3, "checkpoint opt-out request failed");
+    check(h.count("RESUME 0") == 3, "ckpt=0 read a previously cached prefix");
+    check(model.checkpoints == 1 && model.restored == 0, "ckpt=0 saved or restored a snapshot");
+    check(model.seen.size() == 6 && h.tokens() == std::vector<int>({3,3,3}), "ckpt=0 did not perform fresh prefill");
+}
+void failed_checkpoint_restore_recomputes_safely() {
+    Synthetic model; model.snapshots_enabled = true; model.fail_restore = true;
+    Harness h; h.input = {"GEN 4 temperature=0 0,1"};
+    bool second = false, checked = false;
+    size_t before = 0;
+    h.after_write = [&](const std::string &line) {
+        if (!second && line.starts_with("DONE ")) {
+            second = true; before = model.seen.size();
+            h.input.push_back("GEN 4 temperature=0 0,1");
+        } else if (second && !checked && line.starts_with("T ")) {
+            checked = true;
+            check(model.seen.size() == before + 1 && model.seen.back().token == 1, "restore failure did not recompute the final prompt token");
+        }
+    };
+    run(model,h);
+    check(!h.contains("ERR ") && checked && h.contains("RESUME 1"), "failed restore poisoned the request");
+    check(model.restore_attempts == 1 && model.restored == 0, "restore failure was not exercised");
+    check(h.tokens() == std::vector<int>({2,3,4,5,2,3,4,5}), "restore fallback changed target output");
+}
+void checkpoint_image_identity_is_not_token_identity() {
+    const auto unique = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto path = std::filesystem::temp_directory_path() / ("hy4-checkpoint-" + unique + ".sve");
+    struct Remove { std::filesystem::path p; ~Remove(){std::error_code e; std::filesystem::remove(p,e);} } cleanup{path};
+    const int32_t header[]{0x31455653,2,2,1,4};
+    auto write_image = [&](float first) {
+        const float values[]{first,2,3,4,5,6,7,8};
+        std::ofstream file(path,std::ios::binary|std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(header),sizeof(header));
+        file.write(reinterpret_cast<const char*>(values),sizeof(values));
+        check(bool(file),"failed to write image checkpoint fixture");
+    };
+    write_image(1);
+    Synthetic model; model.snapshots_enabled = true;
+    Harness h;
+    const auto command = "GENI 1 temperature=0 img_keys=abcd " + path.string() + " 1,7,7,2";
+    h.input = {command};
+    int completed = 0;
+    h.after_write = [&](const std::string &line) {
+        if (!line.starts_with("DONE ")) return;
+        ++completed;
+        if (completed == 2) write_image(9);
+        if (completed < 3) h.input.push_back(command);
+    };
+    run(model,h,0,true);
+    check(!h.contains("ERR ") && completed == 3, "image checkpoint request failed");
+    check(model.restored == 1 && h.count("RESUME 4") == 1, "identical image did not reuse exactly one full prefix");
+    check(h.contains("RESUME 1") && model.checkpoints == 2, "changed image reused stale full-prefix embeddings");
+    check(model.seen.size() == 7 && model.seen[4].embedding.front() == 9, "changed image was not ingested after the text prefix");
+    check(h.tokens() == std::vector<int>({3,3,3}), "image checkpoint changed text output");
 }
 void batch_isolation_and_cancel() {
     Synthetic model;
@@ -298,6 +431,24 @@ void rejection_commit_restores_carry_after_target_truncate() {
     check(h.tokens() == std::vector<int>({2,3,4,5,6}), "rejection/replay changed target outputs");
     check(model.provisional >= 2, "rejection test did not execute another proposal round");
 }
+void cancellation_during_canonical_mtp_replay_does_not_emit() {
+    Synthetic model; model.mtp = true;
+    Harness h; h.input = {"BGEN 0 8 slot_read=1 temperature=0 0,1"};
+    bool injected = false;
+    model.after_draft = [&](bool target_features) {
+        // Prompt ingestion also uses target features. Wait until admission has
+        // emitted its seed, then cancel inside accepted-prefix canonical replay.
+        if (target_features && !injected && !h.tokens(0).empty()) {
+            injected = true;
+            h.input.push_back("BSTOP 0");
+        }
+    };
+    run(model,h,2);
+    check(injected && model.target_replays > 1, "cancellation did not reach canonical MTP replay");
+    check(!h.contains("ERR "), "canonical replay cancellation failed");
+    check(h.tokens(0) == std::vector<int>({2}), "MTP replay emitted a token after receiving BSTOP");
+    check(h.count("BDONE 0 ") == 1 && h.contains("BDONE 0 1 cancel"), "canonical replay cancellation did not release its slot exactly once");
+}
 void cancellation_at_last_gpu_boundary_does_not_emit() {
     for (int phase = 0; phase < 3; ++phase) {
         Synthetic model;
@@ -377,10 +528,11 @@ void reading_slots_are_admitted_and_interleaved() {
           "long-prompt prefill was not scheduled in fair bounded chunks");
 }
 #ifndef _WIN32
-int stdio_mode() {
+int stdio_mode(bool checkpoints) {
     Synthetic model;
     model.mtp = true;
     model.slow = true;
+    model.snapshots_enabled = checkpoints;
     ServerOptions o;
     o.mtp = 2;
     o.prefill_chunk = 8;
@@ -419,6 +571,48 @@ int stdio_mode() {
     return serve_device(model, geometry(), eos, o, std::move(transport));
 }
 #endif
+void shared_capacity_defers_instead_of_failing_live_requests() {
+    Synthetic model; model.capacity = 16;
+    Harness h;
+    for (int slot = 0; slot < 4; ++slot) {
+        std::string prompt;
+        for (int i = 0; i < 7; ++i) prompt += std::to_string(slot) + ',';
+        prompt += '1';
+        h.input.push_back("BGEN " + std::to_string(slot) + " 4 slot_read=1 temperature=0 " + prompt);
+    }
+    run(model, h);
+    check(!h.contains("ERR "), "shared capacity caused a partial-response fault");
+    for (int slot = 0; slot < 4; ++slot) {
+        check(h.tokens(slot) == std::vector<int>({2,3,4,5}), "capacity wait truncated a response");
+        check(h.count("BDONE " + std::to_string(slot) + " ") == 1, "capacity wait lost a completion");
+    }
+    auto first_end = std::find_if(h.output.begin(), h.output.end(), [](const auto& l){return l.starts_with("BDONE 0 ");});
+    auto second_admit = std::find(h.output.begin(), h.output.end(), "BADM 1 1");
+    check(first_end < second_admit, "admission overcommitted requested token budgets");
+}
+void cancellation_while_waiting_for_shared_capacity() {
+    Synthetic model; model.capacity = 12;
+    Harness h;
+    h.input = {"BGEN 0 4 slot_read=1 temperature=0 1,1,1,1,1,1,1,1",
+               "BGEN 1 4 slot_read=1 temperature=0 0,0,0,0,0,0,0,1"};
+    model.after_forward = [&]{if (model.forwards == 2) h.input.push_back("BSTOP 1");};
+    run(model, h);
+    check(!h.contains("ERR "), "cancelled capacity wait failed");
+    check(h.tokens(0) == std::vector<int>({2,3,4,5}) && h.tokens(1).empty(), "capacity cancellation crossed sessions");
+    check(h.contains("BDONE 1 0 cancel"), "capacity cancellation did not finish");
+}
+void wide_prefill_keeps_verification_bounded() {
+    Synthetic model; model.prefill_limit = 32; model.mtp = true;
+    Harness h;
+    std::string prompt;
+    for (int i = 0; i < 39; ++i) prompt += "0,";
+    prompt += '1';
+    h.input.push_back("GEN 4 temperature=0 " + prompt);
+    run(model, h, 2, false, 32);
+    check(!h.contains("ERR "), "wide prefill failed");
+    check(model.largest_batch == 32, "wide prefill was silently tiled back to eight");
+    check(h.tokens() == std::vector<int>({2,3,4,5}) && model.target_replays > 0, "wide MTP prefill changed outputs");
+}
 void bad_request_recovers() {
     Synthetic model;
     Harness h;
@@ -434,20 +628,28 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         for (int i = 1; i < argc; ++i)
             if (std::string(argv[i]) == "--stdio")
-                return stdio_mode();
+                return stdio_mode(std::any_of(argv + 1, argv + argc, [](const char *arg){return std::string(arg) == "--checkpoints";}));
 #else
         (void)argc;
         (void)argv;
 #endif
         single_and_cache();
+        full_prompt_checkpoint_skips_prefill_and_restores_mtp();
+        checkpoint_opt_out_does_not_read_or_save_cache();
+        failed_checkpoint_restore_recomputes_safely();
+        checkpoint_image_identity_is_not_token_identity();
         batch_isolation_and_cancel();
         batch_uses_shared_device_tile();
         embedded_prompt_and_invalid_input();
         speculation_matches_greedy_and_uses_target_features();
         queued_cancel_is_not_lost();
         rejection_commit_restores_carry_after_target_truncate();
+        cancellation_during_canonical_mtp_replay_does_not_emit();
         cancellation_at_last_gpu_boundary_does_not_emit();
         reading_slots_are_admitted_and_interleaved();
+        shared_capacity_defers_instead_of_failing_live_requests();
+        cancellation_while_waiting_for_shared_capacity();
+        wide_prefill_keeps_verification_bounded();
         bad_request_recovers();
         std::cout << "Hy4 scheduler CPU protocol tests passed\n";
         return 0;

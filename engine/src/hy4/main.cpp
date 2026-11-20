@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -287,14 +288,15 @@ int main(int argc, char **argv) {
     try {
         std::string model, token_text, dump_file, dump_dir, cuda_devices, cuda_budgets, expert_budgets,
             mmproj;
-        int slots = 1, prefill_chunk = 8, mtp = 0;
+        int slots = 1, prefill_chunk = 0, mtp = 0;
         int64_t pool = 0;
-        size_t reserve_mib = 1024;
-        std::string kv_location = "ram", kv_type;
+        size_t reserve_mib = 1024, vision_reserve_mib = 0;
+        std::string kv_location = "ram", kv_type, swa_kv_location;
         bool pool_given = false;
         int threads = 4, count = 1;
         int64_t context = 8192;
-        bool server = false, inspect = false, capabilities = false;
+        bool server = false, inspect = false, capabilities = false, direct_kv = false,
+             preload_mtp_first = true, placement_given = false;
         Sampling settings;
         settings.top_k = 0;
         for (int i = 1; i < argc; ++i) {
@@ -343,7 +345,7 @@ int main(int argc, char **argv) {
                 pool = integer_value(1, int64_t(8) << 26);
                 pool_given = true;
             } else if (a == "--prefill-chunk")
-                prefill_chunk = int(integer_value(1, 8));
+                prefill_chunk = int(integer_value(1, 512));
             else if (a == "--mtp")
                 mtp = int(integer_value(0, 5));
             else if (a == "--no-mtp")
@@ -354,8 +356,21 @@ int main(int argc, char **argv) {
                 kv_location = value();
             else if (a == "--kv-type")
                 kv_type = value();
+            else if (a == "--swa-kv-location")
+                swa_kv_location = value();
+            else if (a == "--direct-kv")
+                direct_kv = true;
+            else if (a == "--preload-mtp-first") {
+                preload_mtp_first = true;
+                placement_given = true;
+            } else if (a == "--trunk-first") {
+                preload_mtp_first = false;
+                placement_given = true;
+            }
             else if (a == "--vram-reserve-mib")
                 reserve_mib = size_t(integer_value(0, 1048576));
+            else if (a == "--vision-gpu-reserve-mib")
+                vision_reserve_mib = size_t(integer_value(0, 1048576));
             else if (a == "--capabilities")
                 capabilities = true;
             else if (a == "--serve")
@@ -371,8 +386,10 @@ int main(int argc, char **argv) {
 #ifdef STRATA_HY4_CUDA
                 std::cout << "  --cuda-devices 0,1 [--cuda-cache-mib M,M] [--expert-cache-mib M,M]\n";
 #endif
-                std::cout << "  --slots N --context-pool N --prefill-chunk 1..8 --mtp 0..5\n"
+                std::cout << "  --slots N --context-pool N --prefill-chunk 1..512 --mtp 0..5\n"
                              "  --kv-location ram|gpu --kv-type f16|f32 --vram-reserve-mib N\n"
+                             "  --direct-kv --preload-mtp-first | --trunk-first --vision-gpu-reserve-mib N\n"
+                             "  --swa-kv-location ram|gpu (bounded sliding-window KV only)\n"
                              "  --mmproj FILE (image embedding input) | --capabilities (no model load)\n";
                 return 0;
             } else
@@ -381,7 +398,7 @@ int main(int argc, char **argv) {
         if (capabilities) {
 #ifdef STRATA_HY4_CUDA
             std::cout
-                << R"({"architecture":"hy_v4_flash","backend":"cuda","features":{"gpu_experts":true,"vision":true,"mtp":true,"batching":true,"prompt_cache":true,"kv_gpu":true,"kv_ram":true}})"
+                << R"({"architecture":"hy_v4_flash","backend":"cuda","features":{"gpu_experts":true,"vision":true,"vision_gpu_reserve":true,"mtp":true,"batching":true,"prompt_cache":true,"kv_gpu":true,"kv_ram":true},"limits":{"prefill_rows":512,"slots":8,"mtp":5}})"
                 << '\n';
 #else
             std::cout
@@ -390,9 +407,13 @@ int main(int argc, char **argv) {
 #endif
             return 0;
         }
+        const bool device_requested = !cuda_devices.empty();
+        if (!prefill_chunk) prefill_chunk = device_requested ? 256 : 8;
+        if (swa_kv_location.empty()) swa_kv_location = device_requested ? "gpu" : "ram";
         if (model.empty() || count < 0 || context <= 0 || threads < 1 || threads > 256 || slots < 1 ||
-            slots > 8 || prefill_chunk < 1 || prefill_chunk > 8 || mtp < 0 || mtp > 5 ||
+            slots > 8 || prefill_chunk < 1 || prefill_chunk > 512 || mtp < 0 || mtp > 5 ||
             (kv_location != "ram" && kv_location != "gpu") ||
+            (swa_kv_location != "ram" && swa_kv_location != "gpu") ||
             (!kv_type.empty() && kv_type != "f16" && kv_type != "f32"))
             throw std::runtime_error(
                 "invalid model, context, threading, batching, MTP or KV option; see --help");
@@ -402,13 +423,13 @@ int main(int argc, char **argv) {
             throw std::runtime_error("context pool must cover one full request");
         if (!mmproj.empty() && !std::filesystem::is_regular_file(mmproj))
             throw std::runtime_error("projector file not found");
-        const bool device_requested = !cuda_devices.empty();
         if (kv_type.empty())
             kv_type = device_requested ? "f16" : "f32";
         if (!device_requested && (kv_type != "f32" || pool != context))
             throw std::runtime_error("CPU reference uses F32 KV in one context; it has no shared KV pool");
         if (!device_requested && (!cuda_budgets.empty() || !expert_budgets.empty() || slots != 1 || mtp ||
-                                  !mmproj.empty() || kv_location != "ram"))
+                                  !mmproj.empty() || kv_location != "ram" || direct_kv ||
+                                  placement_given || vision_reserve_mib || swa_kv_location != "ram"))
             throw std::runtime_error(
                 "GPU serving features require --cuda-devices; CPU mode is the serial reference backend");
 #ifndef STRATA_HY4_CUDA
@@ -433,11 +454,19 @@ int main(int argc, char **argv) {
             options.expert_bytes = limits(expert_budgets);
             options.slots = slots;
             options.batch = 8;
+            options.prefill_rows = prefill_chunk;
             options.context_pool = pool;
             options.max_context = context;
             options.host_kv = kv_location == "ram";
+            options.host_swa_kv = swa_kv_location == "ram";
+            options.stage_kv = !direct_kv;
+            options.preload_mtp_first = preload_mtp_first && mtp > 0;
             options.f32_kv = kv_type == "f32";
             options.vram_reserve = reserve_mib << 20;
+            if (vision_reserve_mib) {
+                options.vram_reserves.assign(cards.size(), options.vram_reserve);
+                options.vram_reserves.front() = std::max(options.vram_reserve, vision_reserve_mib << 20);
+            }
             device = device_model(engine, options);
         }
 #endif
@@ -464,6 +493,9 @@ int main(int argc, char **argv) {
             return 0;
         }
         const auto prompt = ids(token_text);
+        if (prompt.size() > size_t(context) || size_t(count) > size_t(context) - prompt.size())
+            throw std::runtime_error("prompt + --n exceed context");
+        if (mtp) throw std::runtime_error("--mtp requires --serve; --tokens is the teacher-forcing/debug interface");
         std::ofstream dump;
         if (!dump_file.empty()) {
             dump.open(dump_file, std::ios::binary);
@@ -473,16 +505,34 @@ int main(int argc, char **argv) {
         if (!dump_dir.empty())
             std::filesystem::create_directories(dump_dir);
         Vec logits;
-        size_t position = 0;
+        size_t position = 0, trace_rows = 1;
+        std::map<int, std::pair<size_t, size_t>> selected_trace_rows;
         const Trace trace =
             dump_dir.empty()
                 ? Trace{}
                 : Trace([&](const std::string &stage, int layer, std::span<const float> data) {
-                      const auto name =
-                          std::filesystem::path(dump_dir) /
-                          (std::to_string(position) + "-" + std::to_string(layer) + "-" + stage + ".f32");
-                      std::ofstream f(name, std::ios::binary);
-                      f.write(reinterpret_cast<const char *>(data.data()), data.size_bytes());
+                      if (stage == "attn_selected") {
+                          // Selection lengths vary by query and this hook fires
+                          // once per row, unlike rectangular activation hooks.
+                          auto &[base, row] = selected_trace_rows[layer];
+                          if (base != position) { base = position; row = 0; }
+                          if (row >= trace_rows) throw std::runtime_error("too many selected-index trace rows");
+                          const auto name = std::filesystem::path(dump_dir) /
+                              (std::to_string(position + row++) + "-" + std::to_string(layer) + "-" + stage + ".f32");
+                          std::ofstream f(name, std::ios::binary);
+                          if (!f) throw std::runtime_error("cannot create selection trace file");
+                          f.write(reinterpret_cast<const char *>(data.data()), data.size_bytes());
+                          return;
+                      }
+                      if (data.size() % trace_rows) throw std::runtime_error("non-rowwise teacher-forcing trace");
+                      const size_t width = data.size() / trace_rows;
+                      for (size_t row = 0; row < trace_rows; ++row) {
+                          const auto name = std::filesystem::path(dump_dir) /
+                              (std::to_string(position + row) + "-" + std::to_string(layer) + "-" + stage + ".f32");
+                          std::ofstream f(name, std::ios::binary);
+                          if (!f) throw std::runtime_error("cannot create trace file");
+                          f.write(reinterpret_cast<const char *>(data.data() + row * width), width * sizeof(float));
+                      }
                   });
         auto forward = [&](int32_t token) {
 #ifdef STRATA_HY4_CUDA
@@ -494,12 +544,30 @@ int main(int argc, char **argv) {
 #endif
             return engine.forward(token, trace);
         };
+#ifdef STRATA_HY4_CUDA
+        if (device) {
+            for (size_t begin = 0; begin < prompt.size();) {
+                const size_t take = std::min(size_t(device->prefill_batch()), prompt.size() - begin);
+                std::vector<DeviceInput> rows(take);
+                for (size_t row = 0; row < take; ++row) rows[row].token = prompt[begin + row];
+                trace_rows = take;
+                if (dump || trace) {
+                    auto output = device->forward(rows, trace);
+                    if (output.size() != take) throw std::runtime_error("teacher-forcing output row count");
+                    for (const auto &row : output) if (dump)
+                        dump.write(reinterpret_cast<const char *>(row.data()), row.size() * sizeof(float));
+                    logits = std::move(output.back());
+                } else logits = device->prefill(rows, false);
+                begin += take; position += take;
+            }
+        } else
+#endif
         for (int32_t token : prompt) {
             logits = forward(token);
-            if (dump)
-                dump.write(reinterpret_cast<const char *>(logits.data()), logits.size() * sizeof(float));
+            if (dump) dump.write(reinterpret_cast<const char *>(logits.data()), logits.size() * sizeof(float));
             ++position;
         }
+        trace_rows = 1;
         std::mt19937_64 rng(settings.seed);
         for (int i = 0; i < count; ++i) {
             const int token =

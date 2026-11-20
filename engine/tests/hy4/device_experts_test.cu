@@ -3,6 +3,7 @@
 #include "strata/hy4/device_experts.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -102,7 +103,7 @@ struct Fixture {
     }
 };
 
-std::vector<float> execute(Fixture &f, ExpertExecutor &executor, int device, int rows, bool ones = false) {
+std::vector<float> execute(Fixture &f, ExpertExecutor &executor, int device, int rows, bool ones = false,int layer=0) {
     ck(cudaSetDevice(device));
     cudaStream_t stream;
     ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -127,7 +128,7 @@ std::vector<float> execute(Fixture &f, ExpertExecutor &executor, int device, int
     ck(cudaMemcpyAsync(dx.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice, stream));
     ck(cudaMemcpyAsync(di.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice, stream));
     ck(cudaMemcpyAsync(dw.p, weights.data(), weights.size() * 4, cudaMemcpyHostToDevice, stream));
-    executor.run(0, device, dx.as<float>(), di.as<int32_t>(), dw.as<float>(), dy.as<float>(), rows, stream);
+    executor.run(layer, device, dx.as<float>(), di.as<int32_t>(), dw.as<float>(), dy.as<float>(), rows, stream);
     ck(cudaMemcpyAsync(out.data(), dy.p, out.size() * 4, cudaMemcpyDeviceToHost, stream));
     ck(cudaStreamSynchronize(stream));
     for (float v : out)
@@ -146,17 +147,38 @@ void same(const std::vector<float> &a, const std::vector<float> &b, const char *
     // remain when a native multi-column architecture path is explicitly enabled.
     require(error <= 1e-6f * (1 + maximum), name);
 }
+float rounded_prefill(float x,int type){return type==30?__bfloat162float(__float2bfloat16_rn(x)):__half2float(__float2half_rn(x));}
+void wide_cpu_reference(Fixture& f,const std::vector<float>& actual,int rows){
+    if(rows<=8)return;
+    auto gate=f.tensors.at("blk.0.ffn_gate_exps.weight").values();auto up=f.tensors.at("blk.0.ffn_up_exps.weight").values();auto down=f.tensors.at("blk.0.ffn_down_exps.weight").values();
+    const int gu=f.infos.at("blk.0.ffn_gate_exps.weight").type,dt=f.infos.at("blk.0.ffn_down_exps.weight").type,n=f.g.latent;
+    for(float& v:gate)v=rounded_prefill(v,gu);for(float& v:up)v=rounded_prefill(v,gu);for(float& v:down)v=rounded_prefill(v,dt);
+    double error=0,maximum=0;
+    for(int row:{0,rows/2,rows-1}){std::vector<double> expected(n,0);Vec x(n);for(int i=0;i<n;++i)x[i]=rounded_prefill(std::sin(float(size_t(row)*n+i)*.017f)*.4f,gu);
+        for(int k=0;k<f.g.used;++k){const int expert=(row+k)%f.g.experts;Vec h(n);
+            for(int j=0;j<n;++j){double g=0,u=0;for(int i=0;i<n;++i){const size_t at=(size_t(expert)*n+j)*n+i;g+=double(gate[at])*x[i];u+=double(up[at])*x[i];}
+                const float clipped=std::min(float(g),10.f),clipped_up=std::clamp(float(u),-10.f,10.f);h[j]=rounded_prefill(clipped/(1.f+std::exp(-clipped))*clipped_up,dt);}
+            for(int j:{0,1,std::min(17,n-1),n/2,n-1}){double value=0;for(int i=0;i<n;++i)value+=double(down[(size_t(expert)*n+j)*n+i])*h[i];expected[j]+=value*(k?.75:.25);}
+        }
+        for(int j:{0,1,std::min(17,n-1),n/2,n-1}){maximum=std::max(maximum,std::abs(expected[j]));error=std::max(error,std::abs(double(actual[size_t(row)*n+j])-expected[j]));}
+    }
+    std::cout<<"prefill independent CPU experts width="<<n<<" rows="<<rows<<" max_abs="<<error<<" normalized="<<error/(1+maximum)<<'\n';
+    // Rounding is explicitly represented in the oracle. This covers FP32 dot
+    // reduction/SiLU error propagated through the second projection, not routing.
+    require(error<=2e-4*(1+maximum),"prefill differs from independently decoded CPU expert reference");
+}
 void quant_case(int device, int width, int down_type, int rows) {
     Fixture f(width, down_type);
-    ExpertExecutor streaming(f.g, f.lookup(), {{device, 0}}, 8, 2);
+    ExpertExecutor streaming(f.g, f.lookup(), {{device, 0}}, std::max(8,rows), 2);
     const auto expected = execute(f, streaming, device, rows);
+    wide_cpu_reference(f,expected,rows);
     require(streaming.stats().cache_bytes == 0, "zero budget allocated a resident cache");
     require(streaming.reserved_bytes(device) ==
-                ExpertExecutor::memory_requirements(f.g, f.lookup()).device_workspace,
+                ExpertExecutor::memory_requirements(f.g, f.lookup(),std::max(8,rows)).device_workspace,
             "workspace accounting");
-    ExpertExecutor lru(f.g, f.lookup(), {{device, f.per_expert}}, 8, 2);
+    ExpertExecutor lru(f.g, f.lookup(), {{device, f.per_expert}}, std::max(8,rows), 2);
     same(expected, execute(f, lru, device, rows), "LRU eviction/streaming");
-    ExpertExecutor cached(f.g, f.lookup(), {{device, f.per_expert * f.g.experts}}, 8, 2);
+    ExpertExecutor cached(f.g, f.lookup(), {{device, f.per_expert * f.g.experts}}, std::max(8,rows), 2);
     same(expected, execute(f, cached, device, rows), "cold cache/native");
     same(expected, execute(f, cached, device, rows), "warm cache/native");
     require(cached.preload_layer(0, device), "full layer preload");
@@ -178,9 +200,10 @@ void float_clamp_case(int device) {
 }
 void floating_resident_case(int device, int type, int width, int rows) {
     Fixture f(width, 0, true, type);
-    ExpertExecutor streaming(f.g, f.lookup(), {{device, 0}}, 8, 2);
+    ExpertExecutor streaming(f.g, f.lookup(), {{device, 0}}, std::max(8,rows), 2);
     const auto expected = execute(f, streaming, device, rows);
-    ExpertExecutor resident(f.g, f.lookup(), {{device, f.per_expert * f.g.experts}}, 8, 2);
+    wide_cpu_reference(f,expected,rows);
+    ExpertExecutor resident(f.g, f.lookup(), {{device, f.per_expert * f.g.experts}}, std::max(8,rows), 2);
     require(resident.preload_layer(0, device), "floating full layer preload");
     const auto before = resident.stats();
     same(expected, execute(f, resident, device, rows), "floating resident routed/native");
@@ -189,9 +212,35 @@ void floating_resident_case(int device, int type, int width, int rows) {
     require(resident.stats().resident_calls == before.resident_calls + 1,
             "floating resident fast path not used");
     require(resident.reserved_bytes(device) ==
-                ExpertExecutor::memory_requirements(f.g, f.lookup()).device_workspace +
+                ExpertExecutor::memory_requirements(f.g, f.lookup(),std::max(8,rows)).device_workspace +
                     f.per_expert * f.g.experts,
             "floating workspace accounting");
+}
+void mixed_arena_case(int device){
+    Fixture q4(1536,12),q6(1536,14),bf(1536,0,true,30);Fixture* variants[]{&q4,&q6,&bf};
+    Geometry g=q4.g;g.layers=3;g.clamp={10,10,10};std::map<std::string,strata::TensorInfo> infos;std::map<std::string,Tensor> tensors;
+    for(int layer=0;layer<3;++layer)for(const auto& [old,t]:variants[layer]->tensors){const auto name="blk."+std::to_string(layer)+"."+old.substr(6);infos[name]=*t.info;infos[name].name=name;tensors[name]=Tensor{&infos[name],t.data};}
+    const auto lookup=[&](const std::string& name)->const Tensor&{return tensors.at(name);};
+    ExpertExecutor baseline(g,lookup,{{device,0}},31,2);std::vector<std::vector<float>> expected;
+    for(int layer=0;layer<3;++layer)expected.push_back(execute(*variants[layer],baseline,device,31,false,layer));
+    size_t before,total;ck(cudaMemGetInfo(&before,&total));const size_t cap=2*bf.per_expert+q4.per_expert+256;
+    ExpertExecutor cached(g,lookup,{{device,cap}},31,2);size_t initialized;ck(cudaMemGetInfo(&initialized,&total));
+    const auto memory=cached.stats();
+    require(memory.arena_bytes==cap,"arena reservation is not its full configured capacity");
+    require(cached.reserved_bytes(device)==ExpertExecutor::memory_requirements(g,lookup,31).device_workspace+cap,"reserved bytes hid unoccupied arena space");
+    require(memory.observed_driver_bytes==before-initialized,"quiescent driver allocation delta accounting");
+    const size_t reserved=cached.reserved_bytes(device);
+    for(int repeat=0;repeat<3;++repeat)for(int layer:{0,2,1,2,0})same(expected[layer],execute(*variants[layer],cached,device,31,false,layer),"mixed-format arena LRU/coalescing");
+    require(cached.preload_layer(0,device),"mixed arena pinned Q4 layer did not fit");
+    for(int layer:{2,1,2,0})same(expected[layer],execute(*variants[layer],cached,device,31,false,layer),"mixed arena overlap with pinned prefix");
+    same(execute(q4,baseline,device,8,false,0),execute(q4,cached,device,8,false,0),"narrow decode after mixed arena prefill");
+    size_t after;ck(cudaMemGetInfo(&after,&total));
+    require(cached.reserved_bytes(device)==reserved,"runtime cache grew its arena");
+    require(cached.stats().cache_bytes<=cap&&cached.stats().evictions>0,"arena charge or eviction accounting");
+    // No per-entry device allocation remains; allow one lazy driver page but not
+    // the old2MiB-per-expert growth during cache population and eviction.
+    require(after>=initialized||initialized-after<=size_t(2)<<20,"cache entries allocated device storage outside arena");
+    std::cout<<"mixed arena requested="<<cap<<" observed_driver="<<memory.observed_driver_bytes<<" fixed_requested="<<reserved-cap<<" runtime_growth="<<(initialized>after?initialized-after:0)<<'\n';
 }
 void peer_case(const std::vector<int> &devices) {
     Fixture f(256, 14);
@@ -221,11 +270,16 @@ int main(int argc, char **argv) {
             quant_case(devices[0], 256, 12, rows);
             quant_case(devices[0], 1536, 14, rows);
         }
+        for(int rows:{9,15,16,31,128,256,511}){quant_case(devices[0],256,12,rows);quant_case(devices[0],256,14,rows);}
         float_clamp_case(devices[0]);
         for (int type : {0, 1, 30})
             for (int rows : {1, 8})
                 floating_resident_case(devices[0], type, 256, rows);
         floating_resident_case(devices[0], 30, 1536, 8);
+        floating_resident_case(devices[0],30,1536,128);
+        quant_case(devices[0],1536,14,128);
+        for(int type:{0,1,30})floating_resident_case(devices[0],type,256,31);
+        mixed_arena_case(devices[0]);
         if (devices.size() > 1)
             peer_case(devices);
         else

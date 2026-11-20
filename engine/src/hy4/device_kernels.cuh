@@ -326,8 +326,7 @@ __global__ void selected_sort(const int32_t *input, int32_t *out, int count) {
 }
 __global__ void map_write(int32_t *map, const int32_t *slots, const int32_t *pos, const int32_t *cells,
                           int rows, int capacity) {
-    int i = threadIdx.x;
-    if (i < rows)
+    for (int i = threadIdx.x; i < rows; i += blockDim.x)
         map[size_t(slots[i]) * capacity + pos[i]] = cells[i];
 }
 __global__ void feature_store(const float *hidden, float *ring, const int32_t *slots, const int32_t *pos,
@@ -371,8 +370,28 @@ __global__ void selection(const int32_t *groups, int32_t *selected, int count, i
     else if (i < history + tail)
         selected[i] = pos - pos % pool + i - history;
 }
+// Raw copy only: retain F16/F32 bit patterns, gather each selected KV cell once
+// into GPU-local storage before the many attention heads reuse it.
+template<class T>
+__global__ void stage_kv(const T* source,T* destination,const int32_t* map,const int32_t* selected,
+                          int pos,int count,int width,int ring){
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=size_t(count)*width)return;
+    const int cell=i/width,logical=selected?selected[cell]:pos-count+1+cell,physical=ring?logical%ring:map[logical];
+    destination[i]=source[size_t(physical)*width+i%width];
+}
+template<class T>
+__global__ void stage_kv_batch(const T* source,T* destination,const int32_t* maps,const int32_t* selected,
+                                const int32_t* slots,const int32_t* positions,int base,int width,int topk,
+                                int pool,int window,int capacity,int stage_capacity,int ring){
+    const int row=base+blockIdx.y,pos=positions[row];const bool sparse=!ring&&pos+1>topk;
+    const int count=ring?min(window,pos+1):sparse?min(pos/pool,topk/pool-1)*pool+pos%pool+1:pos+1;
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=size_t(count)*width)return;
+    const int cell=i/width,logical=sparse?selected[size_t(row)*topk+cell]:pos-count+1+cell;
+    const int physical=ring?slots[row]*ring+logical%ring:maps[size_t(slots[row])*capacity+logical];
+    destination[(size_t(blockIdx.y)*stage_capacity+cell)*width+i%width]=source[size_t(physical)*width+i%width];
+}
 template <class T>
-__global__ void attn_split(const float *q_abs, const float *query, const T *cache, const int32_t *map,
+__device__ void attn_split_body(const float *q_abs, const float *query, const T *cache, const int32_t *map,
                            const int32_t *selected, const float *sinks, float *partial, int row, int pos,
                            int heads, int latent, int head_width, int rope_width, int value_width,
                            int selected_count, int chunks, int ring) {
@@ -381,6 +400,9 @@ __global__ void attn_split(const float *q_abs, const float *query, const T *cach
     __shared__ float score[tile];
     int start = chunk * tile, count = min(tile, selected_count - start);
     int stride = latent + rope_width;
+    if(start>=selected_count){const size_t dest=(size_t(h)*chunks+chunk)*(latent+2);
+        if(threadIdx.x==0){partial[dest]=-INFINITY;partial[dest+1]=0;}
+        for(int d=threadIdx.x;d<latent;d+=threads)partial[dest+2+d]=0;return;}
     for (int j = warp; j < count; j += threads / 32) {
         int logical = selected ? selected[start + j] : pos - selected_count + 1 + start + j;
         int physical = ring ? logical % ring : map[logical];
@@ -429,7 +451,7 @@ __global__ void attn_split(const float *q_abs, const float *query, const T *cach
         partial[dest + 2 + d] = v;
     }
 }
-__global__ void attn_merge(const float *partial, float *out, int rows, int heads, int latent, int chunks,
+__device__ void attn_merge_body(const float *partial, float *out, int rows, int heads, int latent, int chunks,
                            int row) {
     int h = blockIdx.x;
     float mx = -INFINITY;
@@ -448,6 +470,32 @@ __global__ void attn_merge(const float *partial, float *out, int rows, int heads
         }
         out[(size_t(row) * heads + h) * latent + d] = v / den;
     }
+}
+template<class T>
+__global__ void attn_split(const float* q_abs,const float* query,const T* cache,const int32_t* map,
+                           const int32_t* selected,const float* sinks,float* partial,int row,int pos,
+                           int heads,int latent,int head_width,int rope_width,int value_width,
+                           int selected_count,int chunks,int ring){
+    attn_split_body(q_abs,query,cache,map,selected,sinks,partial,row,pos,heads,latent,head_width,rope_width,value_width,selected_count,chunks,ring);
+}
+__global__ void attn_merge(const float* partial,float* out,int rows,int heads,int latent,int chunks,int row){
+    attn_merge_body(partial,out,rows,heads,latent,chunks,row);
+}
+template<class T>
+__global__ void attn_split_batch(const float* q_abs,const float* query,const T* cache,const int32_t* map,
+                                 const int32_t* selected,const float* sinks,float* partial,
+                                 const int32_t* slots,const int32_t* positions,int base,int heads,int latent,
+                                 int head_width,int rope_width,int value_width,int topk,int pool,int window,
+                                 int capacity,int chunks,int ring,bool staged=false,int stage_capacity=0){
+    const int row=base+blockIdx.z,pos=positions[row];
+    const bool sparse=!ring&&pos+1>topk;
+    const int count=ring?min(window,pos+1):sparse?min(pos/pool,topk/pool-1)*pool+pos%pool+1:pos+1;
+    const size_t offset=staged?size_t(blockIdx.z)*stage_capacity*(latent+rope_width):ring?size_t(slots[row])*ring*(latent+rope_width):0;
+    attn_split_body(q_abs,query,cache+offset,staged?nullptr:map+size_t(slots[row])*capacity,staged?nullptr:sparse?selected+size_t(row)*topk:nullptr,
+                    sinks,partial+size_t(blockIdx.z)*heads*chunks*(latent+2),row,staged?count-1:pos,heads,latent,head_width,rope_width,value_width,count,chunks,staged?count:ring);
+}
+__global__ void attn_merge_batch(const float* partial,float* out,int rows,int heads,int latent,int chunks,int base){
+    attn_merge_body(partial+size_t(blockIdx.y)*heads*chunks*(latent+2),out,rows,heads,latent,chunks,base+blockIdx.y);
 }
 __global__ void engram_delta(float *x, const float *normalized_x, const float *keys, const float *signal,
                              const float *gate_weight, const float *scales, const int32_t *valid, int dim,

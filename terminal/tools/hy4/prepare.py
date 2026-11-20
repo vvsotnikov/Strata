@@ -23,7 +23,7 @@ def prepare(
     cuda_devices: str | None = None,
     cuda_cache_mib: str | None = None,
     *, expert_cache_mib: str | None = None, slots: int = 1,
-    context_pool: int | None = None, prefill_chunk: int = 8,
+    context_pool: int | None = None, prefill_chunk: int | None = None,
     kv_location: str = "ram", kv_type: str | None = None, mmproj: Path | None = None,
     mtp: int = 0, native_caps: dict | None = None, vision_gpu: bool = False,
     vram_reserve_mib: int | None = None,
@@ -57,8 +57,19 @@ def prepare(
         raise ValueError("slots must be 1..8")
     if slots > 1 and not features.get("batching"):
         raise ValueError("this Hy4 engine does not implement batched serving")
-    if not 1 <= prefill_chunk <= 8 or kv_location not in ("ram", "gpu") or kv_type not in ("f16", "f32"):
-        raise ValueError("unsupported Hy4 prefill or KV setting")
+    limits = caps.get("limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("the Hy4 engine returned malformed capability limits")  # noqa: TRY004 - invalid executable JSON is a configuration error
+    native_prefill = limits.get("prefill_rows", 8)
+    if type(native_prefill) is not int or native_prefill < 1:
+        raise ValueError("the Hy4 engine returned an invalid prefill limit")
+    max_prefill = min(512 if cuda_devices is not None else 8, native_prefill)
+    if prefill_chunk is None:
+        prefill_chunk = min(256, max_prefill)
+    if type(prefill_chunk) is not int or not 1 <= prefill_chunk <= max_prefill:
+        raise ValueError(f"this Hy4 engine supports prefill chunks of 1..{max_prefill}")
+    if kv_location not in ("ram", "gpu") or kv_type not in ("f16", "f32"):
+        raise ValueError("unsupported Hy4 KV setting")
     if kv_location == "gpu" and (cuda_devices is None or not features.get("kv_gpu")):
         raise ValueError("this Hy4 engine does not support a GPU KV pool")
     if type(mtp) is not int or not 0 <= mtp <= 5 or (mtp and not features.get("mtp")):
@@ -67,6 +78,8 @@ def prepare(
         raise ValueError("vision requires the Hy4 projector and a vision-capable Hy4 engine")
     if vision_gpu and (mmproj is None or cuda_devices is None):
         raise ValueError("GPU vision requires a CUDA model configuration and its projector")
+    if vision_gpu and not features.get("vision_gpu_reserve"):
+        raise ValueError("GPU vision requires an updated Hy4 engine with a vision memory reserve")
     if vram_reserve_mib is not None and (type(vram_reserve_mib) is not int or vram_reserve_mib < 0):
         raise ValueError("VRAM reserve must be nonnegative MiB")
     g = GGUFFile(model)
@@ -132,6 +145,8 @@ def prepare(
             cfg["args"] += ["--expert-cache-mib", expert_cache_mib]
     if vram_reserve_mib is not None:
         cfg["args"] += ["--vram-reserve-mib", str(vram_reserve_mib)]
+    if vision_gpu:
+        cfg["args"] += ["--vision-gpu-reserve-mib", "2048"]
     if mmproj is not None:
         reader = engine.with_name("strata-hy4-vision" + (".exe" if engine.suffix == ".exe" else ""))
         if not reader.is_file():
@@ -163,7 +178,7 @@ if __name__ == "__main__":
     p.add_argument("--vram-reserve-mib", type=int)
     p.add_argument("--slots", type=int, default=1)
     p.add_argument("--context-pool", type=int)
-    p.add_argument("--prefill-chunk", type=int, default=8)
+    p.add_argument("--prefill-chunk", type=int)
     p.add_argument("--kv-location", choices=("ram", "gpu"), default="ram")
     p.add_argument("--kv-type", choices=("f16", "f32"))
     p.add_argument("--mtp", type=int, default=0)

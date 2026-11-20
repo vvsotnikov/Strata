@@ -377,9 +377,11 @@ Vec Engine::attention(const Vec& x, int layer, int64_t pos, const RopePosition& 
     const float base = g_.swa[layer] ? g_.rope_base_swa : g_.rope_base;
     Vec qr = norm(linear(ln("attn_q_a.weight"), x), ln("attn_q_a_norm.weight"));
     Vec query = linear(ln("attn_q_b.weight"), qr);
+    if (trace) trace("attn_query_plain", layer, query);
     Vec kv = linear(ln("attn_kv_a_mqa.weight"), x);
     rms(std::span(kv).first(g_.krank), g_.eps, tensor(ln("attn_kv_a_norm.weight")).values());
     rope(std::span(kv).last(g_.rope_dim), position, base);
+    if (trace) trace("attn_kv", layer, kv);
     auto& c = cache_[layer];
     if (g_.swa[layer]) {
         if (c.kv.empty()) c.kv.resize(static_cast<size_t>(g_.window) * stride);
@@ -393,12 +395,15 @@ Vec Engine::attention(const Vec& x, int layer, int64_t pos, const RopePosition& 
         for (int64_t p = first; p <= pos; ++p) selected.push_back(static_cast<int>(p));
     }
     Vec output(heads * g_.value_dim);
+    Vec absorbed_trace, scores_trace, latent_trace;
+    if (trace) trace("attn_selected", layer, Vec(selected.begin(), selected.end()));
     const Vec sinks = tensor(ln("attn_sinks.weight")).values();
     const float scale = 1.0f / std::sqrt(float(g_.head_dim));
     for (int h = 0; h < heads; ++h) {
         Vec q = linear(ln("attn_k_b.weight"), std::span(query).subspan(h * g_.head_dim, no), h);
         q.insert(q.end(), query.begin() + h * g_.head_dim + no, query.begin() + (h + 1) * g_.head_dim);
         rope(std::span(q).last(g_.rope_dim), position, base);
+        if (trace) absorbed_trace.insert(absorbed_trace.end(), q.begin(), q.end());
         Vec scores(selected.size());
         float maximum = sinks[h];
         for (size_t j = 0; j < selected.size(); ++j) {
@@ -406,6 +411,7 @@ Vec Engine::attention(const Vec& x, int layer, int64_t pos, const RopePosition& 
             scores[j] = dot(q, std::span(c.kv).subspan(cell * stride, stride)) * scale;
             maximum = std::max(maximum, scores[j]);
         }
+        if (trace) scores_trace.insert(scores_trace.end(), scores.begin(), scores.end());
         Vec latent(g_.krank, 0);
         float den = std::exp(sinks[h] - maximum);
         for (size_t j = 0; j < selected.size(); ++j) {
@@ -415,11 +421,20 @@ Vec Engine::attention(const Vec& x, int layer, int64_t pos, const RopePosition& 
             for (int i = 0; i < g_.krank; ++i) latent[i] += probability * c.kv[cell * stride + i];
         }
         for (float& v : latent) v /= den;
+        if (trace) latent_trace.insert(latent_trace.end(), latent.begin(), latent.end());
         Vec head = linear(ln("attn_v_b.weight"), latent, h);
         std::copy(head.begin(), head.end(), output.begin() + h * g_.value_dim);
     }
+    if (trace) {
+        trace("attn_q_absorbed", layer, absorbed_trace);
+        trace("attn_scores_scaled", layer, scores_trace);
+        trace("attn_latent", layer, latent_trace);
+        trace("attn_head_output", layer, output);
+    }
     Vec gate = linear(ln("attn_gate.weight"), x);
     for (size_t i = 0; i < output.size(); ++i) output[i] *= sigmoid(gate[i]);
+    if (trace) trace("attn_gated", layer, output);
+    if (trace) trace("attn_projection_input", layer, output);
     Vec result = norm(linear(ln("attn_output.weight"), output), ln("post_attention_norm.weight"));
     if (trace) { trace("q_resid", layer, qr); trace("attn_out", layer, result); }
     return result;
@@ -438,14 +453,20 @@ Vec Engine::ffn(const Vec& x, int layer, const Trace& trace) {
         if (trace) trace("ffn_down", layer, out);
     } else {
         Vec probs = linear(ln("ffn_gate_inp.weight"), x);
+        if (trace) trace("ffn_moe_logits", layer, probs);
         for (float& p : probs) p = sigmoid(p);
         Vec bias;
         if (tensors_.contains(ln("exp_probs_b.bias"))) bias = tensor(ln("exp_probs_b.bias")).values();
         const auto ids = route(probs, bias, g_.used);
+        if (trace) {
+            const Vec selected(ids.begin(), ids.end());
+            trace("ffn_moe_topk", layer, selected);
+        }
         float den = 0;
         for (int id : ids) den += probs[id];
         den = std::max(den, 6.103515625e-5f);
         Vec latent = linear(ln("ffn_routed_down.weight"), x);
+        if (trace) trace("ffn_routed_input", layer, latent);
         Vec sum(g_.latent, 0);
         for (int id : ids) {
             Vec gate = linear(ln("ffn_gate_exps.weight"), latent, id);
@@ -456,10 +477,15 @@ Vec Engine::ffn(const Vec& x, int layer, const Trace& trace) {
             for (int j = 0; j < g_.latent; ++j) sum[j] += down[j] * w;
         }
         out = linear(ln("ffn_routed_up.weight"), sum);
+        if (trace) {
+            trace("ffn_moe_out", layer, sum);
+            trace("ffn_moe_up", layer, out);
+        }
         Vec shared = linear(ln("ffn_gate_shexp.weight"), x);
         Vec up = linear(ln("ffn_up_shexp.weight"), x);
         swiglu(shared, up);
         shared = linear(ln("ffn_down_shexp.weight"), shared);
+        if (trace) trace("ffn_shexp", layer, shared);
         for (int i = 0; i < g_.dim; ++i) out[i] += shared[i];
     }
     return norm(std::move(out), ln("post_ffw_norm.weight"));

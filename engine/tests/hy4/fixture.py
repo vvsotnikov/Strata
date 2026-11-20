@@ -11,12 +11,16 @@ import numpy as np
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--engine", required=True, type=Path)
 parser.add_argument("--output", required=True, type=Path)
+parser.add_argument("--context", type=int, default=64,
+                    help="Synthetic model context capacity; ordinary fixture checks remain short")
 parser.add_argument(
     "--reference",
     action="store_true",
     help="Run image MRoPE and independent MTP reference driver",
 )
 args = parser.parse_args()
+if not 64 <= args.context <= 1048576:
+    parser.error("--context must be between 64 and 1048576")
 out = args.output
 out.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(5315)
@@ -40,7 +44,7 @@ meta = {
     "general.architecture": "hy_v4_flash",
     "hy_v4_flash.block_count": 4 if args.reference else 3,
     "hy_v4_flash.nextn_predict_layers": int(args.reference),
-    "hy_v4_flash.context_length": 64,
+    "hy_v4_flash.context_length": args.context,
     "hy_v4_flash.embedding_length": D,
     "hy_v4_flash.vocab_size": V,
     "hy_v4_flash.hyper_connection.count": HC,

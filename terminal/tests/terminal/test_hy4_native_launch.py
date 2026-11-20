@@ -159,6 +159,31 @@ class NativeHy4Preparation(unittest.TestCase):
         self.assertNotIn("--expert-cache-mib", args)
         self.assertEqual(cfg["reasoning_effort"], "max")
 
+    def test_wide_prefill_requires_the_native_capability_limit(self):
+        caps = CAPS | {"limits": {"prefill_rows": 512}}
+        path = prepare_module.prepare(self.model, self.engine, self.root / "auto-wide", native_caps=caps, cuda_devices="0")
+        args = json.loads(path.read_text())["args"]
+        self.assertEqual(args[args.index("--prefill-chunk") + 1], "256")
+        for count in (8, 9, 256, 512):
+            with self.subTest(count=count):
+                path = prepare_module.prepare(self.model, self.engine, self.root / "wide", native_caps=caps,
+                                              cuda_devices="0", prefill_chunk=count)
+                args = json.loads(path.read_text())["args"]
+                self.assertEqual(args[args.index("--prefill-chunk") + 1], str(count))
+        for value in (0, 513, True, "256"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "prefill chunks"):
+                prepare_module.prepare(self.model, self.engine, self.root / "bad-wide", native_caps=caps,
+                                       cuda_devices="0", prefill_chunk=value)
+        # The original CUDA executable did not publish limits and accepted only eight.
+        with self.assertRaisesRegex(ValueError, "1..8"):
+            self.prepare(cuda_devices="0", prefill_chunk=9)
+        args = self.prepare(cuda_devices="0")["args"]
+        self.assertEqual(args[args.index("--prefill-chunk") + 1], "8")
+        for limits in ({"prefill_rows": "512"}, {"prefill_rows": True}, {"prefill_rows": 0}, []):
+            with self.subTest(limits=limits), self.assertRaisesRegex(ValueError, "limit"):
+                prepare_module.prepare(self.model, self.engine, self.root / "bad-limit", native_caps=CAPS | {"limits": limits},
+                                       cuda_devices="0")
+
     def test_cpu_reference_is_serial_f32_and_does_not_claim_cuda_features(self):
         cfg = self.prepare()
         self.assertEqual(cfg["backend"], "cpu")
@@ -180,6 +205,21 @@ class NativeHy4Preparation(unittest.TestCase):
         self.assertFalse(cfg["vision"]["gpu"])
         self.assertEqual(Path(cfg["vision"]["exe"]).name, "strata-hy4-vision")
         self.assertIn("--mmproj", cfg["args"])
+        self.assertNotIn("--vision-gpu-reserve-mib", cfg["args"])
+
+    def test_gpu_vision_reserves_only_the_selected_encoder_card(self):
+        (self.root / "strata-hy4-vision").touch()
+        projector = self.root / hy4.PROJECTOR
+        projector.touch()
+        with self.assertRaisesRegex(ValueError, "vision memory reserve"):
+            self.prepare(mmproj=projector, cuda_devices="0,1", vision_gpu=True)
+        caps = CAPS | {"features": CAPS["features"] | {"vision_gpu_reserve": True}}
+        path = prepare_module.prepare(self.model, self.engine, self.root / "gpu-vision", native_caps=caps,
+                                      mmproj=projector, cuda_devices="0,1", vision_gpu=True)
+        cfg = json.loads(path.read_text())
+        self.assertTrue(cfg["vision"]["gpu"])
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--vision-gpu-reserve-mib") + 1], "2048")
 
     def test_missing_native_executable_or_engram_shard_requires_repair(self):
         from strata_cli.launch.runner import files_present

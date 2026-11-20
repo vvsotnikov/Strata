@@ -1,13 +1,16 @@
 """Hy4 parser boundaries, reasoning policy and engine launch isolation."""
 
+import io
+import queue
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from serve.frontend import ChatTemplate, effort_kwargs, parser_for_template, use_family
 from serve.hy4 import Hy4OutputParser, force_text
-from serve.server import Hy4Engine, start_engine_or_fallback
+from serve.server import Hy4Engine, StrataEngine, start_engine_or_fallback, vision_env
 from serve.server_parts.http_api import clean_shared_defaults
 
 NS = ":6124c78e"
@@ -160,6 +163,98 @@ class Hy4Parsing(unittest.TestCase):
             # User-selected Off remains off even when an executable gains MTP.
             start_engine_or_fallback(cfg | {"drafting": "off", "args": ["--cuda-devices", "0", "--mtp", "5"]}, "strata-hy4", None, {}, False, None)
             self.assertEqual(engine.call_args.args[1], ["--cuda-devices", "0", "--slots", "4", "--mtp", "0"])
+
+    def test_effective_gpu_vision_reserve_tracks_the_reader_selection(self):
+        flag = "--vision-gpu-reserve-mib"
+        base = {"arch": "hy_v4_flash", "backend": "cuda", "args": ["--cuda-devices", "0,1"],
+                "drafting": "off", "vision": {"exe": "strata-hy4-vision", "gpu": True}}
+        caps = {"architecture": "hy_v4_flash", "backend": "cuda", "features": {"vision": True, "vision_gpu_reserve": True}}
+        with patch("serve.server.Hy4Engine") as engine, patch("strata_control.hy4.capabilities", return_value=caps):
+            for extra, expected in (({}, "2048"), ({"args": base["args"] + [flag, "0"]}, "2048"),
+                                    ({"args": base["args"] + [flag, "2048"], "user_args": [flag, "4096"]}, "4096"),
+                                    ({"args": base["args"] + [flag, "2048", flag, "3072"]}, "3072"),
+                                    ({"args": base["args"] + [flag + "=4096"]}, "4096")):
+                with self.subTest(extra=extra):
+                    start_engine_or_fallback(base | extra, "strata-hy4", None, {}, False, None)
+                    args = engine.call_args.args[1]
+                    self.assertEqual(args.count(flag), 1)
+                    self.assertEqual(args[args.index(flag) + 1], expected)
+            cpu = base | {"vision": {"exe": "strata-hy4-vision", "gpu": False},
+                          "args": base["args"] + [flag, "2048"], "user_args": [flag, "4096"]}
+            start_engine_or_fallback(cpu, "strata-hy4", None, {}, False, None)
+            self.assertNotIn(flag, engine.call_args.args[1])
+            # An old binary remains usable with a CPU reader and cannot receive its unknown flag.
+            caps["features"].pop("vision_gpu_reserve")
+            start_engine_or_fallback(cpu, "strata-hy4", None, {}, False, None)
+            self.assertNotIn(flag, engine.call_args.args[1])
+            engine.reset_mock()
+            with self.assertRaisesRegex(ValueError, "vision memory reserve"):
+                start_engine_or_fallback(base, "strata-hy4", None, {}, False, None)
+            engine.assert_not_called()
+
+    def test_gpu_vision_rejects_invalid_reserve_before_starting(self):
+        caps = {"architecture": "hy_v4_flash", "backend": "cuda", "features": {"vision": True, "vision_gpu_reserve": True}}
+        for value in ("bad", "-1", "1.5"):
+            cfg = {"arch": "hy_v4_flash", "args": ["--cuda-devices", "0", "--vision-gpu-reserve-mib", value],
+                   "drafting": "off", "vision": {"exe": "strata-hy4-vision", "gpu": True}}
+            with self.subTest(value=value), patch("serve.server.Hy4Engine") as engine, patch("strata_control.hy4.capabilities", return_value=caps), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                start_engine_or_fallback(cfg, "strata-hy4", None, {}, False, None)
+            engine.assert_not_called()
+
+    def test_checkpoint_opt_out_reaches_native_sampling_keys(self):
+        self.assertIn(" ckpt=0", Hy4Engine.sampling_keys({"strata_checkpoint": False}))
+        self.assertNotIn("ckpt=", Hy4Engine.sampling_keys({"strata_checkpoint": True}))
+        self.assertNotIn("ckpt=", Hy4Engine.sampling_keys({}))
+
+    def test_gpu_vision_keeps_the_first_selected_gpu_environment(self):
+        env = {"CUDA_VISIBLE_DEVICES": "GPU-selected2,GPU-selected3"}
+        base = {"arch": "hy_v4_flash", "args": ["--cuda-devices", "0,1"], "drafting": "off"}
+        caps = {"architecture": "hy_v4_flash", "backend": "cuda", "features": {"vision": True, "vision_gpu_reserve": True}}
+        for device in (None, 0, "0"):
+            cfg = base | {"vision": {"gpu": True, "cuda_device": device}}
+            with self.subTest(device=device), patch("serve.server.Hy4Engine"), patch("strata_control.hy4.capabilities", return_value=caps):
+                start_engine_or_fallback(cfg, "strata-hy4", None, env, False, None)
+                self.assertIs(vision_env(cfg, env), env)
+        for device in (1, "1", 3):
+            cfg = base | {"vision": {"gpu": True, "cuda_device": device}}
+            with self.subTest(device=device), patch("serve.server.Hy4Engine") as engine, patch("strata_control.hy4.capabilities", return_value=caps), self.assertRaisesRegex(ValueError, "first selected"):
+                start_engine_or_fallback(cfg, "strata-hy4", None, env, False, None)
+            engine.assert_not_called()
+        generic = vision_env({"vision": {"cuda_device": 3}}, env)
+        self.assertEqual(generic["CUDA_VISIBLE_DEVICES"], "3")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "GPU-selected2,GPU-selected3")
+
+    def test_only_hy4_pump_consumes_live_info(self):
+        for cls in (Hy4Engine, StrataEngine):
+            engine = object.__new__(cls)
+            engine.proc = SimpleNamespace(stdout=io.StringIO("INFO expert_bytes=123 uploads=-2 kind=f16\nDONE 0\n"))
+            engine.lines = queue.Queue()
+            engine.slot_q, engine.slot_busy = [], []
+            engine.info = {"existing": 7}
+            engine._pump()
+            if cls is Hy4Engine:
+                self.assertEqual(engine.info, {"existing": 7, "expert_bytes": 123, "uploads": -2, "kind": "f16"})
+            else:
+                self.assertEqual(engine.info, {"existing": 7})
+                self.assertTrue(engine.lines.get_nowait().startswith("INFO "))
+            self.assertEqual(engine.lines.get_nowait(), "DONE 0\n")
+            self.assertIsNone(engine.lines.get_nowait())
+
+    def test_old_hy4_pump_cannot_replace_new_process_info(self):
+        engine = object.__new__(Hy4Engine)
+        def output():
+            engine.proc = object()
+            engine.info = {"new_process": 1}
+            yield "INFO expert_bytes=999\n"
+        engine.proc = SimpleNamespace(stdout=output())
+        engine.lines = queue.Queue()
+        engine.slot_q, engine.slot_busy = [], []
+        engine.info = {}
+        engine.ended = False
+        engine._pump()
+        self.assertEqual(engine.info, {"new_process": 1})
+        self.assertFalse(engine.ended)
+        self.assertIsNone(engine.lines.get_nowait())
 
 
 if __name__ == "__main__":

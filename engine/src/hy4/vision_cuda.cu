@@ -173,6 +173,55 @@ class Cuda final : public Backend {
         if (stream_)
             cudaStreamDestroy(stream_);
     }
+    std::string admission_error(int pw, int ph) override {
+        check(cudaSetDevice(o_.cuda_device));
+        check(cudaStreamSynchronize(stream_));
+        for (void *p : work_)
+            check(cudaFree(p));
+        work_.clear();
+        size_t weight_bytes = 0, temporary = 0;
+        const auto matrix_bytes = [&](const std::string &name) {
+            const auto &tensor = lookup_(name);
+            const bool fp32 = o_.fp32 || tensor.info->type == 0;
+            const size_t bytes = tensor.info->elements() * (fp32 ? 4 : 2);
+            weight_bytes += bytes;
+            if (!fp32 && tensor.info->type == 30 && !matrices_.contains(name))
+                temporary = std::max(temporary, bytes);
+        };
+        const auto vector_bytes = [&](const std::string &name) {
+            weight_bytes += lookup_(name).info->elements() * sizeof(float);
+        };
+        matrix_bytes("v.patch_embd.weight");
+        vector_bytes("v.patch_embd.bias");
+        for (int layer = 0; layer < g_.layers; ++layer) {
+            const auto n = [&](const char *s) { return "v.blk." + std::to_string(layer) + "." + s; };
+            for (const char *s : {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"})
+                vector_bytes(n(s));
+            for (const char *s : {"attn_q", "attn_k", "attn_v", "attn_out", "ffn_up", "ffn_down"}) {
+                matrix_bytes(n((std::string(s) + ".weight").c_str()));
+                vector_bytes(n((std::string(s) + ".bias").c_str()));
+            }
+        }
+        vector_bytes("mm.pre_norm.weight");
+        vector_bytes("v.image_newline");
+        for (const char *s : {"mm.0", "mm.2"}) {
+            matrix_bytes(std::string(s) + ".weight");
+            vector_bytes(std::string(s) + ".bias");
+        }
+        size_t available = 0, total = 0;
+        check(cudaMemGetInfo(&available, &total));
+        const size_t workspace = cuda_workspace_bytes(g_, pw, ph);
+        const size_t missing_weights = weight_bytes > weight_bytes_ ? weight_bytes - weight_bytes_ : 0;
+        // cuBLAS internals/allocator granularity and concurrent serving retain
+        // headroom beyond the exact arrays. Do not evict text experts implicitly.
+        constexpr size_t reserve = size_t(256) << 20;
+        if (cuda_memory_fits(available, missing_weights, workspace, temporary, reserve))
+            return {};
+        return "CUDA admission rejected " + std::to_string(pw * ph) + " image patches: free=" +
+               std::to_string(available) + " new_weights=" + std::to_string(missing_weights) +
+               " workspace=" + std::to_string(workspace) + " conversion=" + std::to_string(temporary) +
+               " reserve=" + std::to_string(reserve);
+    }
     Vec encode(const Vec &patches, const Vec &positions, int pw, int ph, const VisionTrace &trace) override {
         check(cudaSetDevice(o_.cuda_device));
         check(cudaStreamSynchronize(stream_));
@@ -276,6 +325,7 @@ class Cuda final : public Backend {
         void *p = nullptr;
         check(cudaMalloc(&p, bytes));
         weights_.push_back(p);
+        weight_bytes_ += bytes;
         return p;
     }
     const float *vector(const std::string &name) {
@@ -359,6 +409,7 @@ class Cuda final : public Backend {
     cudaStream_t stream_ = nullptr;
     cublasHandle_t blas_ = nullptr;
     std::vector<void *> weights_, work_;
+    size_t weight_bytes_ = 0;
     std::map<std::string, Matrix> matrices_;
     std::map<std::string, const float *> vectors_;
 };

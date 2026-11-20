@@ -18,6 +18,30 @@ EXE = os.environ.get("STRATA_HY4_TEST_SERVER")
 
 @unittest.skipUnless(EXE, "build hy4_server_test and set STRATA_HY4_TEST_SERVER")
 class NativeProtocol(unittest.TestCase):
+    def test_checkpoint_false_is_fresh_and_leaves_no_future_cache(self):
+        with tempfile.TemporaryDirectory(prefix="hy4-native-checkpoint-") as folder:
+            engine = Hy4Engine(EXE, ["--stdio", "--checkpoints"], log=str(Path(folder) / "engine.log"))
+            try:
+                sent = []
+                send = engine._send
+                def tracked(command):
+                    sent.append(command)
+                    return send(command)
+                engine._send = tracked
+                def request(prompt, checkpoint):
+                    output = [token for token in engine.generate(prompt, 1, {"temperature": 0, "strata_checkpoint": checkpoint}, threading.Event()) if token is not None]
+                    self.assertEqual(output, [(prompt[-1] + 1) % 8])
+                    return dict(engine.last)
+                request([1, 2], True)
+                self.assertEqual(request([1, 2], False)["reused"], 0)
+                self.assertIn(" ckpt=0 ", sent[-1])
+                request([3, 4], False)
+                self.assertEqual(request([3, 4], True)["reused"], 0)
+                self.assertEqual(request([3, 4], True)["reused"], 2)
+                self.assertFalse(any(engine.slot_busy))
+            finally:
+                engine.close()
+
     def test_frontend_closing_on_native_eos_drains_complete_stats(self):
         with tempfile.TemporaryDirectory(prefix="hy4-native-eos-") as folder:
             engine = Hy4Engine(EXE, ["--stdio", "--mtp", "2"], log=str(Path(folder) / "engine.log"))

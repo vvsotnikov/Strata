@@ -33,6 +33,7 @@ if sys.platform == "win32":
 
 import argparse
 import contextlib
+import copy
 import collections
 import base64
 import hashlib
@@ -1038,6 +1039,15 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if getattr(self, "native_family", None) == "hy4" and line.startswith("INFO "):
+                if self.proc is proc:
+                    facts = {}
+                    for item in line.split()[1:]:
+                        key, separator, value = item.partition("=")
+                        if key and separator:
+                            facts[key] = int(value) if value.lstrip("-").isdigit() else value
+                    self.info = {**self.info, **facts}
+                continue  # Hy4 completion telemetry never belongs to an admission/token queue
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
                 if sample is not None and self.proc is proc:
@@ -2864,7 +2874,7 @@ class Hy4Engine(StrataEngine):
     def sampling_keys(sampling: dict) -> str:
         if sampling.get("strata_tune") or sampling.get("logit_bias") or top_logprobs(sampling) is not None:
             raise ValueError("Hy4 tuning keys, logit bias and logprobs are not implemented")
-        cleaned = {k: v for k, v in sampling.items() if not k.startswith("strata_")}
+        cleaned = {k: v for k, v in sampling.items() if k == "strata_checkpoint" or not k.startswith("strata_")}
         keys = StrataEngine.sampling_keys(cleaned)
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
@@ -3891,6 +3901,10 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
     keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
     dev = (cfg.get("vision") or {}).get("cuda_device")
+    if cfg.get("arch") == "hy_v4_flash":
+        if (cfg.get("vision") or {}).get("gpu") and dev not in (None, 0, "0"):
+            raise ValueError("Hy4 GPU vision must use the first selected engine GPU; nonzero cuda_device overrides are unsupported")
+        return env  # visible ordinal zero, never physical GPU0 from a generic override
     if dev is None and cfg.get("backend") == "hip":
         dev = vision_card_off_igpu(env, archs)
     if dev is None:
@@ -5071,10 +5085,12 @@ class Service:
             self.prompts.forget(ids)
 
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None, *, count_only=False):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if count_only:
+            messages = copy.deepcopy(messages)
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -5096,11 +5112,12 @@ class Service:
                     else:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, store=not count_only)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
-        self.embeddings.path = None
-        self.embeddings.keys = None
+        if not count_only:
+            self.embeddings.path = None
+            self.embeddings.keys = None
         images = images_of(messages)
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
@@ -5158,6 +5175,8 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
+        if count_only:
+            return ids, kwargs.get("enable_thinking", True) is not False, None
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -7878,7 +7897,17 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+            if svc.family == "hy4":
+                self._no_local_images(messages)
+                callable_tools, _ = anthropic_tools(req)
+                if tool_choice_of(req.get("tool_choice"))[0] == "none":
+                    tools = callable_tools = None
+                force = svc.force_text(forced_call(req.get("tool_choice"), tools, callable_tools))
+                ids, _, _ = svc.prepare(messages, tools, kw, force=force, req=req, count_only=True)
+                count = len(ids)
+            else:
+                count = len(svc.encode_prompt(messages, tools, kw, store=False))
+            self._json(200, {"input_tokens": count})
 
         def _anthropic(self, req):
             svc.load()
@@ -8035,6 +8064,25 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
             raise ValueError("this Hy4 engine does not implement vision")
         if (cfg.get("vision") or {}).get("elastic") or cfg.get("vram_elastic"):
             raise ValueError("Hy4 GPU vision uses an explicit VRAM reserve; elastic cache controls are not implemented")
+        reserve_flag = "--vision-gpu-reserve-mib"
+        reserve_groups = [group for group in user_args.groups(args) if group[0].split("=", 1)[0] == reserve_flag]
+        args = user_args.flat([group for group in user_args.groups(args) if group[0].split("=", 1)[0] != reserve_flag])
+        if (cfg.get("vision") or {}).get("gpu"):
+            if (cfg.get("vision") or {}).get("cuda_device") not in (None, 0, "0"):
+                raise ValueError("Hy4 GPU vision must use the first selected engine GPU; nonzero cuda_device overrides are unsupported")
+            if not devices or not features.get("vision_gpu_reserve"):
+                raise ValueError("GPU vision requires an updated Hy4 CUDA engine with a vision memory reserve")
+            reserve = 2048
+            for group in reserve_groups:
+                value = group[0].split("=", 1)[1] if "=" in group[0] and len(group) == 1 else group[1] if len(group) == 2 else ""
+                try:
+                    requested = int(value)
+                except ValueError:
+                    raise ValueError("Hy4 GPU vision reserve must be nonnegative integer MiB") from None
+                if requested < 0:
+                    raise ValueError("Hy4 GPU vision reserve must be nonnegative integer MiB")
+                reserve = requested or 2048
+            args += [reserve_flag, str(reserve)]
         if option("--kv-location", "ram") == "gpu" and not features.get("kv_gpu"):
             raise ValueError("this Hy4 engine does not implement a GPU KV pool")
         # Keep server admission and native slot count in agreement, including a
