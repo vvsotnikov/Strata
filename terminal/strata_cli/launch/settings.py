@@ -243,9 +243,12 @@ def check_parallel(s: LaunchSettings, *, vram_gb: float | None, fitted: int | No
 
 def check_context(s: LaunchSettings, *, max_fit_tokens: int | None = None) -> list[Notice]:
     out: list[Notice] = []
-    if s.context is not None and s.context > 262144:
+    if s.context is not None and s.context > 262144 and s.family != "hy4":
         out.append(Notice("warn", f"{context_label(s.context)} is more than the model was trained on (256K).",
                           "Setup adds rope scaling for it (experimental); answers may get less reliable."))
+    if s.family == "hy4" and s.context and s.context > 1048576:
+        out.append(Notice("warn", f"{context_label(s.context)} exceeds Hy4's declared 1M context.",
+                          "The native loader rejects this limit; choose at most 1M."))
     if max_fit_tokens and s.context and s.context > max_fit_tokens:
         out.append(Notice("warn", f"{context_label(s.context)} is bigger than this computer's memory comfortably holds.",
                           f"{context_label(max_fit_tokens)} is the recommended size."))

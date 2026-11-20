@@ -132,7 +132,7 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen35"
     if p == "qwen2":
         return "qwen2"
-    if p.startswith("deepseek"):
+    if p == "hy_v4" or p.startswith("deepseek"):
         return "deepseek3"
     return None
 

@@ -57,6 +57,9 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
+        from serve.toolformat import tool_format
+        if tool_format(self.source) == "hy4" and "preserve_thinking" in kwargs:
+            kwargs.setdefault("preserved_thinking", kwargs.pop("preserve_thinking"))
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
         # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
         messages = [m for i, m in enumerate(messages)
@@ -69,9 +72,9 @@ class ChatTemplate:
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
         These are rendering hints, not a guarantee that the model will follow a request."""
-        def render(messages, tools=None):
+        def render(messages, tools=None, **kwargs):
             try:
-                return self.render(messages, tools=tools)
+                return self.render(messages, tools=tools, **kwargs)
             except Exception as exc:                # noqa: BLE001 - a hint only: never stop the server for a probe
                 # A template may reject a role or feature (a custom one may fail in any way): the feature is off,
                 # discovery still answers for the others, and the start-up goes on.
@@ -82,6 +85,8 @@ class ChatTemplate:
         tools = [{"name": f"strata_caps_call_{i}", "description": "strata_caps_description",
                   "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}
                  for i in range(2)]
+        from serve.toolformat import tool_format
+        hy4 = tool_format(self.source) == "hy4"
         tool_prompt = render([user], tools)
 
         def calls_supported(count):
@@ -92,6 +97,13 @@ class ChatTemplate:
             replies = [f"strata_caps_result_{i}" for i in range(count)]
             messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
             prompt = render(messages, tools)
+            if hy4:
+                from serve.hy4 import namespace_from_template, template_calls
+                try:
+                    return template_calls(prompt, namespace_from_template(self.source), tools) == calls \
+                        and all(reply in prompt for reply in replies)
+                except ValueError:
+                    return False
             # Instructions include example XML and literal tag names, which are not model output. Parse only
             # complete calls to our probe functions, using the same body parser as OutputParser.
             bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
@@ -105,13 +117,14 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
-        return {"supports_tools": all(s in tool_prompt for s in
-                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
+        needles = ("strata_caps_call_0", "strata_caps_description", "<tool_call", "<arg_key") if hy4 else \
+            ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")
+        return {"supports_tools": all(s in tool_prompt for s in needles),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),
                 "supports_parallel_tool_calls": calls_supported(2),
-                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
+                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history, **({"preserve_thinking": True} if hy4 else {}))}
 
 
 # ------------------------------------------------------------------------------------------------ requests
@@ -137,12 +150,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 _EFFORT_QWEN = dict(EFFORT)
+_EFFORT_HY4 = {"none": "no_think", "off": "no_think", "minimal": "no_think", "disabled": "no_think",
+               "false": "no_think", "no_think": "no_think", "low": "low", "high": "high",
+               "max": "max", "maximum": "max", "xhigh": "max"}
 
 
 def use_family(family: str | None) -> None:
-    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table."""
+    """Select the effort vocabulary of the single model served by this process."""
     EFFORT.clear()
-    EFFORT.update(_EFFORT_QWEN)
+    EFFORT.update(_EFFORT_HY4 if family == "hy4" else _EFFORT_QWEN)
 
 
 def effort_kwargs(value) -> dict:
@@ -150,11 +166,14 @@ def effort_kwargs(value) -> dict:
     if value is None or value == "":
         return {}
     if value is False:
-        return {"enable_thinking": False}
+        return {"enable_thinking": False, "reasoning_effort": "no_think"} if EFFORT.get("none") == "no_think" else {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        levels = "none, low, high or max" if EFFORT.get("none") == "no_think" else "none, low, medium or high"
+        raise ValueError(f"unknown reasoning effort {value!r}: use {levels}")
     level = EFFORT[key]
+    if level == "no_think":
+        return {"enable_thinking": False, "reasoning_effort": "no_think"}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
@@ -164,6 +183,8 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
+    if EFFORT.get("none") == "no_think":
+        return {"reasoning_effort": "low" if n < 2048 else "high" if n < 8192 else "max"}
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
@@ -845,7 +866,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
         req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        kwargs["enable_thinking"] = False
+        kwargs.update(effort_kwargs(False))
     elif effort:
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
@@ -857,7 +878,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
-        kwargs["enable_thinking"] = False
+        kwargs.update(effort_kwargs(False))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -2956,4 +2977,7 @@ def parser_for_template(source: str | None):
     the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
     here reads keep OutputParser (the same class as before this existed)."""
     from serve import toolformat
+    if toolformat.tool_format(source or "") == "hy4":
+        from serve.hy4 import parser_for_source
+        return parser_for_source(source)
     return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser

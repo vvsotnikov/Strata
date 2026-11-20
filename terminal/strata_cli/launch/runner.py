@@ -294,6 +294,14 @@ def files_present(cfg: dict) -> list[str]:
             continue                                      # Qwen3.6: a number is the draft depth, not a folder (#3298)
         if flag in args and args.index(flag) + 1 < len(args) and not Path(args[args.index(flag) + 1]).exists():
             missing.append(args[args.index(flag) + 1])
+    if cfg.get("arch") == "hy_v4_flash":
+        if cfg.get("exe") and not Path(cfg["exe"]).is_file():
+            missing.append(str(cfg["exe"]))
+        args = list(cfg.get("args") or [])
+        if "--model" in args and args.index("--model") + 1 < len(args):
+            from strata_control.hy4 import FILES
+            folder = Path(args[args.index("--model") + 1]).parent
+            missing.extend(str(folder / name) for name in FILES if not (folder / name).is_file() and str(folder / name) not in missing)
     vision = cfg.get("vision")
     if isinstance(vision, dict) and vision.get("mmproj") and not Path(str(vision["mmproj"])).exists():
         missing.append(str(vision["mmproj"]))                 # the picture reader's file: setup fetches it again
@@ -320,6 +328,23 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
 
     if s.context:
         put("--max-context", str(int(s.context)))
+    if cfg.get("arch") == "hy_v4_flash":
+        if s.parallel:
+            put("--slots", str(int(s.parallel)))
+            cfg["parallel"] = int(s.parallel)
+        if s.kv:
+            if s.kv != "fp16":
+                raise ValueError("Hy4 uses native F16/F32 KV; Qwen INT8/KV encodings do not apply")
+            put("--kv-type", "f16")
+        if s.vision == "off":
+            cfg.pop("vision", None)
+            if "--mmproj" in args:
+                i = args.index("--mmproj")
+                del args[i:i+2]
+        elif s.vision and isinstance(cfg.get("vision"), dict):
+            put("--mmproj", str(cfg["vision"]["mmproj"]))
+        cfg["args"] = args
+        return cfg
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
@@ -705,6 +730,49 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
     apply_user_defaults(cfg, base, defaults or {})            # #5858: the user's run-defaults.json, below everything else
     carry_settings(cfg, prev)                                # what the Settings view saved since the last start survives this launch
+    if cfg.get("arch") == "hy_v4_flash":
+        cfg.pop("layer_split", None)
+        a = list(cfg.get("args") or [])
+        def native_value(name, default=None):
+            return a[a.index(name)+1] if name in a and a.index(name)+1 < len(a) else default
+        def native_put(name, value):
+            nonlocal a
+            from strata_control import user_args
+            a = user_args.merge(a, [name, str(value)])
+            if any(user_args.flag_of(group) == name for group in user_args.groups(cfg.get("user_args"))):
+                cfg["user_args"] = user_args.merge(cfg["user_args"], [name, str(value)])
+        explicit_slots = a_changes.get("--slots") if "--slots" in a_changes else None
+        slots = int(explicit_slots if explicit_slots is not None else s.parallel if s.parallel is not None else native_value("--slots", cfg.get("parallel", 1)))
+        if not 1 <= slots <= 8:
+            raise ValueError("Hy4 supports 1..8 native slots")
+        cfg["parallel"] = slots
+        native_put("--slots", slots)
+        for option in ("--max-context", "--context-pool"):
+            value = native_value(option)
+            if value is not None:
+                native_put(option, S.parse_context(value))
+        context = int(native_value("--max-context", s.context or 8192))
+        pool = int(native_value("--context-pool", context))
+        if not 1 <= context <= 1048576 or not context <= pool <= slots * 1048576:
+            raise ValueError("Hy4 shared context pool must cover a request of at most 1M tokens")
+        cfg["context_pool"] = pool
+        native_put("--max-context", context)
+        native_put("--context-pool", pool)
+        chosen_cards = cfg.get("gpu")
+        if cfg.get("backend") == "cuda" and chosen_cards is not None and "--cuda-devices" not in a_changes:
+            n = len(chosen_cards) if isinstance(chosen_cards, list) else 1
+            native_put("--cuda-devices", ",".join(str(i) for i in range(n)))
+        if "--mtp" in a_changes:
+            value = a_changes["--mtp"]
+            n = 0 if value in (None, "off", "none", "false") else 2 if value in (True, "on", "true") else int(value)
+            if not 0 <= n <= 5:
+                raise ValueError("Hy4 MTP window must be 0..5")
+            cfg["mtp"], cfg["drafting"] = bool(n), "mtp" if n else "off"
+            native_put("--mtp", n)
+        elif s.mtp == "on" or s.drafting in ("mtp", "auto"):
+            cfg["drafting"], cfg["mtp"] = s.drafting or "mtp", True
+            native_put("--mtp", int(native_value("--mtp", 0)) or 2)
+        cfg["args"] = a
     for key, value in server_set.items():                    # an explicit value from this command line beats what an earlier start saved
         if value is None:
             cfg.pop(key, None)
@@ -953,6 +1021,16 @@ class Runner:
 
     # ---- 1. the engine
     def ensure_engine(self) -> None:
+        if self.s.family == "hy4":
+            from strata_control import hy4
+            # No matching release component exists. The ordinary setup step
+            # builds both Hy4 executables from this checkout, with its devices.
+            executable = hy4.engine_path(Path(self.catalog.strata.setup_module().ROOT))
+            text = "Using the supplied native Hy4 executable." if os.environ.get("STRATA_HY4_ENGINE") else "Hy4's native engine is built from this source checkout during model setup."
+            if executable.is_file() and not os.environ.get("STRATA_HY4_ENGINE"):
+                text = "The native Hy4 source target is present; its capabilities are checked before loading."
+            self.emit("engine", text, 100)
+            return
         self.warn_wsl_amd()
         shape = self.model_shape()
         if shape:                                            # a Qwen4 model of its own shape: its engine is a separate component (strata_control/shape_engine.py)
@@ -1103,6 +1181,8 @@ class Runner:
 
     def needed_engine(self) -> tuple[int, ...] | None:
         """The oldest engine this model runs on, from setup.py's own tables (MIN_ENGINE for everything, GYRO_ENGINE for Gyro), or None."""
+        if self.s.family == "hy4":
+            return None  # source-built native target, not the Qwen component version
         try:
             mod = self.catalog.strata.setup_module()
             need = tuple(getattr(mod, "MIN_ENGINE", ()) or ())
@@ -1169,7 +1249,7 @@ class Runner:
         s = self.s
         if s.vision is None:
             row = next((r for r in self.catalog.rows() if (r.family, r.model) == (s.family, s.model)), None)
-            s.vision = self.catalog.picture_default(bool(row.images) if row is not None else False)
+            s.vision = "cpu" if s.family == "hy4" and row is not None and row.images else self.catalog.picture_default(bool(row.images) if row is not None else False)
         return s.vision
 
     def vision_word(self) -> str:
@@ -1208,6 +1288,8 @@ class Runner:
         if ctx:
             args += ["--context", str(ctx)]
         args += ["--vision", self.vision_word()]
+        if fam == "hy4" and s.parallel:
+            args += ["--parallel", str(s.parallel)]
         if s.kv:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
@@ -1217,9 +1299,9 @@ class Runner:
         layer_fetch = getattr(self, "_layer_fetch", False)  # the start's safety net (fetch_missing_drafter): setup fetches the draft layer
         resolved = "mtp" if layer_fetch else self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
-        if mtp_word is None and (layer_fetch or self.layer_back()):
+        if mtp_word is None and fam != "hy4" and (layer_fetch or self.layer_back()):
             mtp_word = "on"                                  # a drafter chosen again after Off: the "mtp": false that Off's "--mtp off" left goes (REAL-USE-1)
-        if mtp_word in ("on", "off") and fam in modelstate.HELPER_FAMILIES:
+        if mtp_word in ("on", "off") and (fam in modelstate.HELPER_FAMILIES or fam == "hy4"):
             args += ["--mtp", mtp_word]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
         if resolved == "dflash2" and fam in modelstate.HELPER_FAMILIES and mtp_word != "off":
             args += ["--drafter", "dflash2"]                 # one drafter per run: a new install fetches DFlash2's pack (below), not the MTP layer
@@ -1810,6 +1892,10 @@ class Runner:
     def resolved_drafting(self, family: str | None) -> str:
         """modelstate.resolved_drafting for this launch: Auto where the all-cards split engine will take the start is the MTP (it runs the model's draft layer and
         nothing else), so the plan and the fetch include the draft layer and not DFlash2's drafter.  A drafter the person chose is kept."""
+        if family == "hy4":
+            if self.s.drafting == "dflash2":
+                raise LaunchError("Hy4 has no supported DFlash2 drafter.", "Use --drafting mtp or --drafting off.", 2)
+            return "off" if self.s.mtp == "off" or self.s.drafting == "off" else "mtp"
         from strata_control import drafting
         if self.feed_without_draft_layer(family):            # the model list says this model has no draft layer: no drafter is planned or fetched for it (G14, APP-LIN 0.2.14)
             return "off"
@@ -1916,6 +2002,9 @@ class Runner:
     def ensure_drafter(self, base_path: Path) -> None:
         """Fetch the DFlash2 drafter when this launch will use it and it is not here yet. Never stops the launch: if it cannot be had, the model
         starts with the MTP and the person is told (recommend, never force)."""
+        if self.s.family == "hy4":
+            self.resolved_drafting("hy4")  # validate an explicit unsupported drafter
+            return  # Hy4's own MTP weights are inside its pinned GGUF
         from strata_control import drafting, drafting_fetch
         want: dict = {}
         try:
@@ -2036,6 +2125,8 @@ class Runner:
         """The all-cards split engine (docs/SPLIT_ENGINE.md): by itself ("auto", the default) for a Qwen model on this PC's NVIDIA or AMD (gfx1201) cards that passes
         strata_control/split_engine.py's rule, never when the run config says "split_engine": "off" (`--split-engine off`, STRATA_SPLIT_ENGINE=0).
         In auto a "no" is silent and the config stays as it is; with "on" it gets one plain line. It never stops a launch."""
+        if cfg.get("arch") == "hy_v4_flash":
+            return  # the Hy4 engine itself places/streams weights across devices
         from strata_control import split_engine as SE
         if SE.mode(cfg) == "off":
             return
@@ -2162,6 +2253,10 @@ class Runner:
     # ---- 4. tuning
     def tune(self) -> None:
         s = self.s
+        if s.family == "hy4":
+            if s.tune != "skip":
+                self.emit("tune", "Hy4 uses its native memory planner. The Qwen automatic tuning profiles do not apply.", 100)
+            return
         if s.tune == "skip":
             return
         from strata_control import presets
@@ -2660,6 +2755,8 @@ class Runner:
         engine family; otherwise the standard drafter is downloaded (1.2 GB) and packed on this computer. ``gb``: what is downloaded, ``disk_gb``: what stays on the disk afterwards.
         (0217 item 3: the plan used the installed model's summary, which has no arguments, so it looked for the drafter in another folder and listed one that was installed; and on a feed
         without the tuned file it said 0.34 GB where the launch fetched 1.21 GB.)"""
+        if self.s.family == "hy4":
+            return None  # embedded native MTP, no Qwen draft packs or selectors
         from strata_control import drafting, drafting_fetch
         _b, _cfg = self.installed_state()
         if _b is not None and self.other_copy() is not None:
@@ -2703,6 +2800,16 @@ class Runner:
         row = self.row()
         helpers = s.family in modelstate.HELPER_FAMILIES
         wants_pictures = s.vision not in (None, "off") and row is not None and bool(row.images)
+        if s.family == "hy4" and wants_pictures and not any(p["kind"] in ("mmproj", "vision") for p in parts):
+            from strata_control import hy4
+            if s.model_path:
+                own = Path(s.model_path)
+                folder = own if own.is_dir() else own.parent
+            else:
+                data = Path(s.data_dir) if s.data_dir else self.catalog.data_dir()
+                folder = self.catalog.model_folder(data, s.family, s.model)
+            if not (folder / hy4.PROJECTOR).is_file():
+                parts.append({"kind": "mmproj", "label": "the Hy4 picture reader", "gb": round(hy4.PINS[hy4.PROJECTOR][0] / 1e9, 1)})
         if helpers and (st.own_files or not st.installed):
             # a model that is not set up yet (or the person's own files) comes without the draft layer and the picture reader: setup fetches them
             # next to the prepared data, unless they are there already
@@ -2770,11 +2877,20 @@ class Runner:
                 text += " To skip the draft layer (a little slower, less memory), add --mtp off."
             if any(p["kind"] == "dflash2" for p in parts):
                 text += " To skip the DFlash2 drafter, add --drafting mtp."
-        if not engine and here:
+        if s.family == "hy4":
+            from strata_control import hy4
+            try:
+                native = hy4.engine_path(Path(self.catalog.strata.setup_module().ROOT))
+                engine = native.is_file()
+            except ValueError:
+                engine = False
+            here = []
+            text += " Hy4 uses a native engine built from this source checkout; no published engine component is downloaded."
+        elif not engine and here:
             # B03: an engine IS installed, but this plan cannot use it (its signature cannot be checked here, or it is for another card): not "missing"
             text += (f" An engine ({', '.join(here[:3])}) is installed, but it did not pass Strata's check on this computer, so Strata looks for a working one "
                      "first. `strata components engine` says why.")
-        elif not engine:
+        elif not engine and s.family != "hy4":
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
         if intel:
             text += " For the Intel card Strata builds the model's pack from your files itself, once; it takes a few minutes and downloads nothing."
@@ -2971,6 +3087,8 @@ class Runner:
 
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
+        if self.s.family == "hy4":
+            return "Drafting: off" if self.resolved_drafting("hy4") == "off" else "Drafting: native MTP when supported by the source-built Hy4 executable; no external drafter"
         from strata_control import drafting
         if self.feed_without_draft_layer():                  # the model list says this model has no draft layer: setup fetches none and the engine starts without a drafter
             return drafting.summary_line(drafting.Decision("off", "off"))

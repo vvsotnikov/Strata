@@ -22,7 +22,8 @@ SLOWER = "may run slower"
 #   gyro: the table is inside the one GGUF; the catalog states the rest (its `ram_gb`: 27.6 / 35 GB), the table is the difference
 #   qwen36 (its own path) has none.  A family this module does not know counts its whole download.
 _GB = 1e9
-_TABLE_BYTES = {"qwen": 28_800_138_432, "swift": 28_800_138_432, "coder": 28_800_138_432, "unsloth": 28_800_138_432, "nvfp4": 51_200_246_176}
+_TABLE_BYTES = {"qwen": 28_800_138_432, "swift": 28_800_138_432, "coder": 28_800_138_432, "unsloth": 28_800_138_432, "nvfp4": 51_200_246_176,
+                "hy4": 63_360_616_128}
 _BIG_UNSLOTH = ("UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0")
 _BIG_TABLE_BYTES = 54_400_261_312
 _PACK_GB = {("nvfp4", "NVFP4-QAD"): 76.8}        # sets whose download is not the files that run: the size of what runs

@@ -24,6 +24,13 @@ holds the technical context behind the short [README](../README.md). Use [AI_SET
 
 ## Model families
 
+This fork also has an opt-in, source-only [Hy4-flash engine](HY4_FLASH.md),
+selected with `--family hy4 --model Q4_K_M` or detected from local GGUF metadata.
+Ordinary source setup builds its native executables; there is no published Hy4
+engine component. This experimental fork entry is separate from the released
+families below. Its runtime capability handshake gates batching, vision and MTP;
+read the Hy4 guide for validation limits.
+
 Treat these as the two top-level families. Coder, Swift, Gyro, NVFP4 and OrcaRouter are Flash-Next variants,
 not additional top-level families.
 

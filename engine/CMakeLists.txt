@@ -830,6 +830,11 @@ if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
 
+option(STRATA_BUILD_HY4 "Build the native Hy4-flash GGUF engine (opt-in)" OFF)
+if(STRATA_BUILD_HY4)
+  add_subdirectory(src/hy4)
+endif()
+
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).
 if(STRATA_BUILD_TESTS)
   set(_strata_test_kinds "cpu")

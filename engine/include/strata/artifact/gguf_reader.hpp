@@ -115,6 +115,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:
+        return "F8_E4M3";
     // Agention's llama.cpp fork: the APR trellis expert types (docs/GYRO.md)
     case 143:
         return "PTQ1_0";
@@ -142,6 +144,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 0:
         elems = 1;
         bytes = 4;
+        return true;
+    case 43:
+        elems = 1;
+        bytes = 1;
         return true;
     case 1:
     case 30:
@@ -333,7 +339,7 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, bool retain_arrays = false) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -383,8 +389,8 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
-            MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            MetaValue e = read_value(c, v.elem, depth + 1, retain_arrays);
+            if (retain_arrays || i < 64) v.items.push_back(std::move(e));
         }
         break;
     }
@@ -396,8 +402,8 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
 
 class GgufFile {
 public:
-    explicit GgufFile(const std::string& path) : path_(path) {
-        try { open(); }
+    explicit GgufFile(const std::string& path, bool retain_arrays = false) : path_(path) {
+        try { open(retain_arrays); }
         catch (...) { close(); throw; }
     }
     ~GgufFile() { close(); }
@@ -430,7 +436,7 @@ public:
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:
-    void open() {
+    void open(bool retain_arrays) {
 #ifdef _WIN32
         HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -462,7 +468,7 @@ private:
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
 #endif
-        parse();
+        parse(retain_arrays);
     }
     void close() {
 #ifdef _WIN32
@@ -475,7 +481,7 @@ private:
 #endif
     }
 
-    void parse() {
+    void parse(bool retain_arrays) {
         Cursor c(base_, size_);
         const uint32_t magic = c.read<uint32_t>();
         if (magic != 0x46554747u) throw std::runtime_error("not a GGUF file (bad magic)");
@@ -488,7 +494,7 @@ private:
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = c.str();
             MetaType t = (MetaType)c.read<uint32_t>();
-            meta_.emplace(std::move(key), read_value(c, t));
+            meta_.emplace(std::move(key), read_value(c, t, 0, retain_arrays));
         }
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
@@ -564,9 +570,9 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
 // and a tensor name present in two shards (GGUF has no index to say which one is meant).
 class GgufModel {
 public:
-    explicit GgufModel(const std::vector<std::string>& paths) {
+    explicit GgufModel(const std::vector<std::string>& paths, bool retain_arrays = false) {
         if (paths.empty()) throw std::runtime_error("GGUF: a model needs at least one shard");
-        for (const auto& p : paths) shards_.push_back(std::make_unique<GgufFile>(p));
+        for (const auto& p : paths) shards_.push_back(std::make_unique<GgufFile>(p, retain_arrays));
         validate_split();
         for (size_t i = 0; i < shards_.size(); ++i)
             for (const auto& t : shards_[i]->tensors()) {
@@ -578,7 +584,9 @@ public:
             }
     }
     /// Opens every shard of the model that `any_shard` belongs to (throws when one is missing).
-    static GgufModel open(const std::string& any_shard) { return GgufModel(gguf_split_paths(any_shard)); }
+    static GgufModel open(const std::string& any_shard, bool retain_arrays = false) {
+        return GgufModel(gguf_split_paths(any_shard), retain_arrays);
+    }
 
     size_t size() const { return shards_.size(); }
     const GgufFile& shard(size_t i) const { return *shards_[i]; }
