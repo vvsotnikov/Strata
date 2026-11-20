@@ -497,8 +497,9 @@ UNSUPPORTED_MODEL_TYPE = ("This model type isn't supported by the Strata engine.
 # The picture readers Strata ships a pinned copy of (setup downloads and checks one of these next to the model).
 # (name, size in bytes) as setup.py pins them: setup would delete a file of that name with another size, so only an exact
 # match is called "the official one".
-PINNED_PROJECTORS = {"mmproj-qwen3.8-flash-next-bf16.gguf": 907543008, "mmproj-f16.gguf": 899283584}
-OUR_PROJECTOR_TYPES = {"qwen3vl_merger"}
+PINNED_PROJECTORS = {"mmproj-qwen3.8-flash-next-bf16.gguf": 907543008, "mmproj-f16.gguf": 899283584,
+                     "mmproj-hy4-flash-bf16.gguf": 1044397440}
+OUR_PROJECTOR_TYPES = {"qwen3vl_merger", "hy_v4_flash"}
 
 
 def _assess_projector(path: Path) -> dict:
@@ -526,8 +527,9 @@ def _assess_projector(path: Path) -> dict:
         row["plain"] = f"{path.name} is the picture reader Strata uses for this model family; pictures will work."
     else:
         row["status"] = "other_name"
+        projector = "mmproj-Hy4-flash-bf16.gguf" if info.get("projector_type") == "hy_v4_flash" else "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
         row["plain"] = (f"{path.name} is a picture reader of the right kind but not the file Strata checks; "
-                        "Strata uses the official one (mmproj-Qwen3.8-Flash-Next-BF16.gguf) and "
+                        f"Strata uses the official one ({projector}) and "
                         "downloads it when it is not in the folder.")
     return row
 
@@ -790,12 +792,16 @@ def plan_import(raw_path: str) -> dict:
             observed_experts.update(inspected["expert_tensor_types"])
             observed_tensor_count += inspected["tensor_count_scanned"]
             observed_payload += int(inspected.get("payload_bytes_required") or 0)
-            if inspected["architecture"] is not None and inspected["architecture"] not in ("qwen4exp", "qwen35moe"):
+            if inspected["architecture"] is not None and inspected["architecture"] not in ("qwen4exp", "qwen35moe", "hy_v4_flash"):
                 issues.append(f"{item.name}: unsupported_architecture")
     q36_candidate = None
+    hy4_candidate = None
     if metadata is not None:
         if metadata["architecture"] == "qwen35moe" and not issues:
             q36_candidate = _qwen36_candidate(shards, issues, notes)       # #5869: Qwen3.6-35B-A3B, the files its engine loads
+        elif metadata["architecture"] == "hy_v4_flash" and not issues:
+            from strata_control.hy4_types import candidate
+            hy4_candidate = candidate(shards, issues, notes)
         elif metadata["architecture"] != "qwen4exp":
             issues.append("unsupported_or_missing_architecture")
         if metadata["tokenizer_model"] != "gpt2" or not metadata["tokenizer_tokens_present"] or \
@@ -814,7 +820,7 @@ def plan_import(raw_path: str) -> dict:
         messages.append(UNSUPPORTED_MODEL_TYPE)
     elif projectors:
         messages.extend(p["plain"] for p in projectors)
-    candidate = q36_candidate or (_candidate_selection(shards) if not (metadata and metadata["architecture"] == "qwen35moe") else None)
+    candidate = hy4_candidate or q36_candidate or (_candidate_selection(shards) if not (metadata and metadata["architecture"] in ("qwen35moe", "hy_v4_flash")) else None)
     if candidate is None and metadata is not None and not issues and metadata["architecture"] == "qwen4exp":
         candidate = _candidate_by_header(shards, observed_tensor_count, observed_payload, observed_experts)
         if candidate is None:

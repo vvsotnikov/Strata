@@ -74,6 +74,16 @@ void swiglu(Vec& gate, const Vec& up, float limit = 0) {
         gate[j] = (g * sigmoid(g)) * u;
     }
 }
+int64_t checked_next_position(const RopePosition& position, int64_t next) {
+    if (std::any_of(position.begin(), position.end(), [](int64_t p) { return p < 0 || p == INT64_MAX; }) || next < -1)
+        throw std::runtime_error("hy4: invalid rotary position");
+    return next < 0 ? *std::max_element(position.begin(), position.end()) + 1 : next;
+}
+void finite_row(std::span<const float> row, int width) {
+    if (row.size() != static_cast<size_t>(width) ||
+        std::any_of(row.begin(), row.end(), [](float v) { return !std::isfinite(v); }))
+        throw std::runtime_error("hy4: invalid input embedding or hidden state");
+}
 }  // namespace
 
 Geometry Geometry::read(const GgufFile& f) {
@@ -155,8 +165,9 @@ Geometry Geometry::read(const GgufFile& f) {
 
 Engine::Engine(const std::string& gguf, int threads, int64_t max_context)
     : model_(GgufModel::open(gguf, true)), g_(Geometry::read(model_.meta())),
-      mm_(std::make_unique<Matmul>(threads)), cache_(g_.layers), max_context_(max_context) {
+      mm_(std::make_unique<Matmul>(threads)), cache_(g_.layers + g_.draft_layers), max_context_(max_context) {
     if (max_context < 1 || max_context > g_.max_context) throw std::runtime_error("hy4: context exceeds model limit");
+    if (g_.draft_layers > 1) throw std::runtime_error("hy4: CPU reference supports one MTP block");
     for (size_t shard = 0; shard < model_.size(); ++shard) {
         for (const auto& t : model_.shard(shard).tensors()) {
             if (!model_.in_bounds(t, shard)) throw std::runtime_error("hy4: truncated or unknown tensor " + t.name);
@@ -194,7 +205,7 @@ void Engine::validate() {
     uint64_t engram_rows = 0;
     for (size_t i = 0; i < g_.offsets.size(); ++i) engram_rows = std::max(engram_rows, g_.offsets[i] + g_.primes[i]);
     check("per_layer_token_embd.weight", {uint64_t(g_.engram_dim), engram_rows});
-    for (int l = 0; l < g_.layers; ++l) {
+    for (int l = 0; l < g_.layers + g_.draft_layers; ++l) {
         const uint64_t nh = g_.heads[l];
         const auto c = [&](const char* suffix, std::initializer_list<uint64_t> shape) { check(layer_name(l, suffix), shape); };
         for (const auto* name : {"attn_norm.weight", "ffn_norm.weight", "post_attention_norm.weight", "post_ffw_norm.weight"}) c(name, {d});
@@ -204,12 +215,12 @@ void Engine::validate() {
         c("attn_k_b.weight", {no, kr, nh}); c("attn_v_b.weight", {kr, vd, nh});
         c("attn_gate.weight", {d, nh * vd}); c("attn_output.weight", {nh * vd, d});
         c("attn_sinks.weight", {nh});
-        for (const auto* kind : {"attn", "ffn"}) {
+        if (l < g_.layers) for (const auto* kind : {"attn", "ffn"}) {
             check(layer_name(l, std::string("hc_") + kind + "_fn.weight"), {d * hc, 2 * hc});
             check(layer_name(l, std::string("hc_") + kind + "_base.weight"), {2 * hc});
             check(layer_name(l, std::string("hc_") + kind + "_scale.weight"), {2});
         }
-        if (g_.indexer[l]) {
+        if (l >= g_.layers || g_.indexer[l]) {
             c("indexer.attn_k.weight", {d, idx}); c("indexer.k_norm.weight", {idx});
             c("indexer.attn_q_b.weight", {qr, idx * uint64_t(g_.index_heads)});
             c("indexer.proj.weight", {d, uint64_t(g_.index_heads)});
@@ -221,6 +232,10 @@ void Engine::validate() {
             c("engram_kv_b.weight", {d, hc + 1}); c("engram_gate.weight", {d, hc});
             c("engram_lookup_norm.weight", {uint64_t(g_.engram_dim), cols});
             c("engram_pre_gamma.weight", {d}); c("engram_hc_scale.weight", {d, hc});
+        }
+        if (l >= g_.layers) {
+            c("nextn.enorm.weight", {d}); c("nextn.hnorm.weight", {d});
+            c("nextn.eh_proj.weight", {2*d, d}); c("nextn.shared_head_norm.weight", {d});
         }
         if (l < g_.dense_layers) {
             c("ffn_gate.weight", {d, uint64_t(g_.dense_ff)}); c("ffn_up.weight", {d, uint64_t(g_.dense_ff)});
@@ -245,8 +260,14 @@ Vec Engine::norm(Vec x, const std::string& name, float eps) {
 }
 
 void Engine::reset() {
-    history_.clear();
+    history_.clear(); positions_.clear(); last_hidden_.clear(); next_rope_ = 0;
     for (auto& c : cache_) c = Cache{};
+    reset_draft();
+}
+
+void Engine::reset_draft() {
+    draft_history_.clear(); draft_positions_.clear(); last_draft_hidden_.clear(); draft_next_rope_ = 0;
+    for (size_t i = g_.layers; i < cache_.size(); ++i) cache_[i] = Cache{};
 }
 
 Engine::Mix Engine::mix(const Vec& x, int layer, const char* kind) {
@@ -302,9 +323,9 @@ Vec Engine::engram(Vec x, int layer, int module, int32_t token) {
     return x;
 }
 
-std::vector<int> Engine::select(const Vec& x, const Vec& q, int layer) {
+std::vector<int> Engine::select(const Vec& x, const Vec& q, int layer, int64_t pos,
+                                const RopePosition& position, const std::vector<RopePosition>& rope_history) {
     auto& c = cache_[layer];
-    const int64_t pos = history_.size();
     const auto ln = [&](const char* name) { return layer_name(layer, name); };
     const int width = g_.index_dim;
     const float base = g_.swa[layer] ? g_.rope_base_swa : g_.rope_base;
@@ -318,12 +339,12 @@ std::vector<int> Engine::select(const Vec& x, const Vec& q, int layer) {
         Vec pooled = pool_key(c.pool_values, c.pool_gates,
                              tensor(ln("indexer_compressor_ape.weight")).values(), width, g_.pool);
         pooled = norm(std::move(pooled), ln("indexer_compressor_norm.weight"));
-        rope(std::span(pooled).last(g_.rope_dim), pos - g_.pool + 1, base);
+        rope(std::span(pooled).last(g_.rope_dim), rope_history.at(pos - g_.pool + 1), base);
         c.pooled.insert(c.pooled.end(), pooled.begin(), pooled.end());
     }
     Vec query = linear(ln("indexer.attn_q_b.weight"), q);
     for (int h = 0; h < g_.index_heads; ++h)
-        rope(std::span(query).subspan(h * width + width - g_.rope_dim, g_.rope_dim), pos, base);
+        rope(std::span(query).subspan(h * width + width - g_.rope_dim, g_.rope_dim), position, base);
     Vec weights = linear(ln("indexer.proj.weight"), x);
     const int groups = static_cast<int>(pos / g_.pool);
     Vec scores(groups, 0);
@@ -348,17 +369,17 @@ std::vector<int> Engine::select(const Vec& x, const Vec& q, int layer) {
     return positions;
 }
 
-Vec Engine::attention(const Vec& x, int layer, const Trace& trace) {
+Vec Engine::attention(const Vec& x, int layer, int64_t pos, const RopePosition& position,
+                      const std::vector<RopePosition>& rope_history, const Trace& trace) {
     const int heads = g_.heads[layer], dim = g_.dim, no = g_.head_dim - g_.rope_dim;
     const int stride = g_.krank + g_.rope_dim;
-    const int64_t pos = history_.size();
     const auto ln = [&](const char* name) { return layer_name(layer, name); };
     const float base = g_.swa[layer] ? g_.rope_base_swa : g_.rope_base;
     Vec qr = norm(linear(ln("attn_q_a.weight"), x), ln("attn_q_a_norm.weight"));
     Vec query = linear(ln("attn_q_b.weight"), qr);
     Vec kv = linear(ln("attn_kv_a_mqa.weight"), x);
     rms(std::span(kv).first(g_.krank), g_.eps, tensor(ln("attn_kv_a_norm.weight")).values());
-    rope(std::span(kv).last(g_.rope_dim), pos, base);
+    rope(std::span(kv).last(g_.rope_dim), position, base);
     auto& c = cache_[layer];
     if (g_.swa[layer]) {
         if (c.kv.empty()) c.kv.resize(static_cast<size_t>(g_.window) * stride);
@@ -366,7 +387,7 @@ Vec Engine::attention(const Vec& x, int layer, const Trace& trace) {
     } else c.kv.insert(c.kv.end(), kv.begin(), kv.end());
     ++c.count;
     std::vector<int> selected;
-    if (g_.indexer[layer]) selected = select(x, qr, layer);
+    if (layer >= g_.layers || g_.indexer[layer]) selected = select(x, qr, layer, pos, position, rope_history);
     else {
         const int64_t first = std::max<int64_t>(0, pos - g_.window + 1);
         for (int64_t p = first; p <= pos; ++p) selected.push_back(static_cast<int>(p));
@@ -377,7 +398,7 @@ Vec Engine::attention(const Vec& x, int layer, const Trace& trace) {
     for (int h = 0; h < heads; ++h) {
         Vec q = linear(ln("attn_k_b.weight"), std::span(query).subspan(h * g_.head_dim, no), h);
         q.insert(q.end(), query.begin() + h * g_.head_dim + no, query.begin() + (h + 1) * g_.head_dim);
-        rope(std::span(q).last(g_.rope_dim), pos, base);
+        rope(std::span(q).last(g_.rope_dim), position, base);
         Vec scores(selected.size());
         float maximum = sinks[h];
         for (size_t j = 0; j < selected.size(); ++j) {
@@ -445,17 +466,36 @@ Vec Engine::ffn(const Vec& x, int layer, const Trace& trace) {
 }
 
 Vec Engine::forward(int32_t token, const Trace& trace) {
+    return forward_at(token, {}, -1, trace);
+}
+
+Vec Engine::forward_at(int32_t token, std::optional<RopePosition> position, int64_t next_rope, const Trace& trace) {
     if (token < 0 || token >= g_.vocab || history_.size() >= static_cast<size_t>(max_context_))
         throw std::runtime_error("hy4: token or context is out of range");
-    Vec embedding = tensor("token_embd.weight").values(token);
+    const RopePosition p = position.value_or(RopePosition{next_rope_, next_rope_, next_rope_});
+    const int64_t next = checked_next_position(p, next_rope);
+    const Vec embedding = tensor("token_embd.weight").values(token);
+    finite_row(embedding, g_.dim);
+    return forward_row(embedding, token, p, next, trace);
+}
+
+Vec Engine::forward_embedding(std::span<const float> embedding, const RopePosition& position,
+                              int64_t next_rope, const Trace& trace) {
+    if (history_.size() >= static_cast<size_t>(max_context_)) throw std::runtime_error("hy4: context is out of range");
+    finite_row(embedding, g_.dim);
+    return forward_row(embedding, -1, position, checked_next_position(position, next_rope), trace);
+}
+
+Vec Engine::forward_row(std::span<const float> embedding, int32_t token, const RopePosition& position,
+                        int64_t next_rope, const Trace& trace) {
     Vec streams;
     for (int h = 0; h < g_.hc; ++h) streams.insert(streams.end(), embedding.begin(), embedding.end());
     for (int layer = 0; layer < g_.layers; ++layer) {
         const auto it = std::find(g_.engram_layers.begin(), g_.engram_layers.end(), layer);
-        if (it != g_.engram_layers.end()) streams = engram(std::move(streams), layer, it - g_.engram_layers.begin(), token);
+        if (token >= 0 && it != g_.engram_layers.end()) streams = engram(std::move(streams), layer, it - g_.engram_layers.begin(), token);
         const auto attn = mix(streams, layer, "attn");
         Vec normalized = norm(attn.value, layer_name(layer, "attn_norm.weight"));
-        streams = finish_mix(streams, attention(normalized, layer, trace), attn.post);
+        streams = finish_mix(streams, attention(normalized, layer, history_.size(), position, positions_, trace), attn.post);
         const auto feed = mix(streams, layer, "ffn");
         normalized = norm(feed.value, layer_name(layer, "ffn_norm.weight"));
         if (trace) trace("ffn_norm", layer, normalized);
@@ -477,7 +517,46 @@ Vec Engine::forward(int32_t token, const Trace& trace) {
     if (trace) trace("result_norm", -1, hidden);
     Vec logits = linear("output.weight", hidden);
     for (float v : logits) if (!std::isfinite(v)) throw std::runtime_error("hy4: nonfinite logits");
-    history_.push_back(token);
+    history_.push_back(token); positions_.push_back(position); next_rope_ = next_rope;
+    last_hidden_ = std::move(hidden);
+    return logits;
+}
+
+Vec Engine::draft_forward(int32_t token, std::span<const float> previous_hidden,
+                          std::optional<RopePosition> position, int64_t next_rope, const Trace& trace) {
+    if (token < 0 || token >= g_.vocab) throw std::runtime_error("hy4: draft token is out of range");
+    const RopePosition p = position.value_or(RopePosition{draft_next_rope_, draft_next_rope_, draft_next_rope_});
+    const Vec embedding = tensor("token_embd.weight").values(token);
+    return draft_row(embedding, previous_hidden, token, p, checked_next_position(p, next_rope), trace);
+}
+
+Vec Engine::draft_forward_embedding(std::span<const float> embedding, std::span<const float> previous_hidden,
+                                    const RopePosition& position, int64_t next_rope, const Trace& trace) {
+    return draft_row(embedding, previous_hidden, -1, position, checked_next_position(position, next_rope), trace);
+}
+
+Vec Engine::draft_row(std::span<const float> embedding, std::span<const float> previous_hidden,
+                      int32_t token, const RopePosition& position, int64_t next_rope, const Trace& trace) {
+    if (!g_.draft_layers || draft_history_.size() >= static_cast<size_t>(max_context_))
+        throw std::runtime_error("hy4: draft block unavailable or draft context is full");
+    finite_row(embedding, g_.dim); finite_row(previous_hidden, g_.dim);
+    const int layer = g_.layers;
+    const auto ln = [&](const char* suffix) { return layer_name(layer, suffix); };
+    Vec joined = norm(Vec(embedding.begin(), embedding.end()), ln("nextn.enorm.weight"));
+    const Vec normalized_hidden = norm(Vec(previous_hidden.begin(), previous_hidden.end()), ln("nextn.hnorm.weight"));
+    joined.insert(joined.end(), normalized_hidden.begin(), normalized_hidden.end());
+    Vec x = linear(ln("nextn.eh_proj.weight"), joined);
+    if (trace) trace("mtp_eh_proj", layer, x);
+    Vec delta = attention(norm(x, ln("attn_norm.weight")), layer, draft_history_.size(), position, draft_positions_, trace);
+    for (int i = 0; i < g_.dim; ++i) x[i] += delta[i];
+    delta = ffn(norm(x, ln("ffn_norm.weight")), layer, trace);
+    for (int i = 0; i < g_.dim; ++i) x[i] += delta[i];
+    Vec hidden = norm(std::move(x), ln("nextn.shared_head_norm.weight"));
+    if (trace) trace("mtp_result_norm", layer, hidden);
+    Vec logits = linear("output.weight", hidden);
+    for (float v : logits) if (!std::isfinite(v)) throw std::runtime_error("hy4: nonfinite draft logits");
+    draft_history_.push_back(token); draft_positions_.push_back(position); draft_next_rope_ = next_rope;
+    last_draft_hidden_ = std::move(hidden);
     return logits;
 }
 

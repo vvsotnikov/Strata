@@ -11,6 +11,11 @@ import numpy as np
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--engine", required=True, type=Path)
 parser.add_argument("--output", required=True, type=Path)
+parser.add_argument(
+    "--reference",
+    action="store_true",
+    help="Run image MRoPE and independent MTP reference driver",
+)
 args = parser.parse_args()
 out = args.output
 out.mkdir(parents=True, exist_ok=True)
@@ -33,8 +38,8 @@ E = 4
 USE = 2
 meta = {
     "general.architecture": "hy_v4_flash",
-    "hy_v4_flash.block_count": 3,
-    "hy_v4_flash.nextn_predict_layers": 0,
+    "hy_v4_flash.block_count": 4 if args.reference else 3,
+    "hy_v4_flash.nextn_predict_layers": int(args.reference),
     "hy_v4_flash.context_length": 64,
     "hy_v4_flash.embedding_length": D,
     "hy_v4_flash.vocab_size": V,
@@ -66,10 +71,11 @@ meta = {
     "hy_v4_flash.expert_weights_scale": 3.998,
     "hy_v4_flash.rope.freq_base": 10000000.0,
     "hy_v4_flash.rope.freq_base_swa": 10000.0,
-    "hy_v4_flash.attention.head_count": [2, 2, 2],
-    "hy_v4_flash.attention.sliding_window_pattern": [False, True, False],
+    "hy_v4_flash.attention.head_count": [2] * (N + int(args.reference)),
+    "hy_v4_flash.attention.sliding_window_pattern": [False, True, False]
+    + ([False] if args.reference else []),
     "hy_v4_flash.attention.indexer.types": [True, False, True],
-    "hy_v4_flash.swiglu_clamp_exp": [0.1, 0.1, 0.1],
+    "hy_v4_flash.swiglu_clamp_exp": [0.1] * (N + int(args.reference)),
     "hy_v4_flash.ple.ngram_size": 3,
     "hy_v4_flash.ple.heads_per_ngram": 2,
     "hy_v4_flash.embedding_length_per_layer_input": 32,
@@ -105,7 +111,7 @@ for name, shape in [
 ]:
     add(name, shape)
 add("output_norm.weight", [D], True)
-for l in range(N):
+for l in range(N + int(args.reference)):
 
     def put(n, s, norm=False, l=l):
         add(f"blk.{l}.{n}", s, norm)
@@ -130,9 +136,13 @@ for l in range(N):
         put(n, s)
     put("attn_q_a_norm.weight", [32], True)
     put("attn_kv_a_norm.weight", [K], True)
-    for kind in ("attn", "ffn"):
+    for kind in ("attn", "ffn") if l < N else ():
         for n, s in [("fn", [D * HC, HC * 2]), ("base", [HC * 2]), ("scale", [2])]:
             put(f"hc_{kind}_{n}.weight", s)
+    if l == N:
+        for n in ("enorm", "hnorm", "shared_head_norm"):
+            put("nextn." + n + ".weight", [D], True)
+        put("nextn.eh_proj.weight", [D * 2, D])
     if l != 1:
         for n, s in [
             ("indexer.attn_k.weight", [D, ID]),
@@ -238,6 +248,13 @@ def sig(x):
 
 def rot(x, pos, base):
     x = x.copy()
+    if not np.isscalar(pos):
+        pos = np.asarray(pos)[
+            [
+                1 if i < 30 and i % 3 == 1 else 2 if i < 30 and i % 3 == 2 else 0
+                for i in range(R // 2)
+            ]
+        ]
     angle = pos * base ** (-np.arange(R // 2, dtype="f4") * 2 / R)
     a = x[..., -R::2].copy()
     b = x[..., -R + 1 :: 2].copy()
@@ -250,22 +267,42 @@ def linear(name, x, plane=None):
     return (w[name] if plane is None else w[name][plane]) @ x
 
 
-cache = [{"kv": [], "v": [], "g": [], "pooled": []} for _ in range(N)]
-hist = []
+cache = [
+    {"kv": [], "v": [], "g": [], "pooled": []} for _ in range(N + int(args.reference))
+]
+hist, dhist, rhist, drhist = [], [], [], []
+last_reference_hidden = None
 traces = {}
 
 
-def forward(token):
-    pos = len(hist)
-    x = np.tile(w["token_embd.weight"][token], (HC, 1))
-    for l in range(N):
+def forward(token, embedding=None, position=None, previous_hidden=None):
+    global last_reference_hidden
+    draft = previous_hidden is not None
+    active_hist, active_positions = (dhist, drhist) if draft else (hist, rhist)
+    pos = len(active_hist)
+    position = pos if position is None else position
+    embedding = w["token_embd.weight"][token] if embedding is None else embedding
+    if draft:
+        pre = f"blk.{N}.nextn."
+        joined = np.concatenate(
+            [
+                norm(embedding, w[pre + "enorm.weight"]),
+                norm(previous_hidden, w[pre + "hnorm.weight"]),
+            ]
+        )
+        x = linear(pre + "eh_proj.weight", joined)[None, :]
+    else:
+        x = np.tile(embedding, (HC, 1))
+    for l in [N] if draft else range(N):
         pre = f"blk.{l}."
         at = lambda s, pre=pre: w[pre + s]
         mv = lambda s, z, pre=pre: linear(pre + s, z)
         nm = lambda z, s, at=at: norm(z, at(s))
-        if l == 1:
+        if l == 1 and token >= 0:
             mult = meta["hy_v4_flash.ple.layer_multipliers"]
-            tokens = [token] + [hist[-i] if len(hist) >= i else 0 for i in (1, 2)]
+            tokens = [token] + [
+                max(0, hist[-i]) if len(hist) >= i else 0 for i in (1, 2)
+            ]
             rolling = (tokens[0] * mult[0]) & ((1 << 64) - 1)
             ix = []
             for i in (1, 2):
@@ -292,6 +329,8 @@ def forward(token):
             )
 
         def mix(kind, mv=mv, at=at, x=x):
+            if draft:
+                return x[0].copy(), np.ones(1, "f4")
             y = mv("hc_" + kind + "_fn.weight", norm(x.flatten()))
             base = at("hc_" + kind + "_base.weight")
             scale = at("hc_" + kind + "_scale.weight")
@@ -305,7 +344,7 @@ def forward(token):
         qr = mv("attn_q_b.weight", q).reshape(H, 32)
         kv = mv("attn_kv_a_mqa.weight", z)
         kv[:K] = nm(kv[:K], "attn_kv_a_norm.weight")
-        kv = rot(kv, pos, 10000 if l == 1 else 10000000)
+        kv = rot(kv, position, 10000 if l == 1 else 10000000)
         c = cache[l]
         c["kv"].append(kv)
         if l != 1:
@@ -320,11 +359,13 @@ def forward(token):
                 c["pooled"].append(
                     rot(
                         nm(pooled, "indexer_compressor_norm.weight"),
-                        pos - P + 1,
+                        active_positions[pos - P + 1],
                         10000000,
                     )
                 )
-            iq = rot(mv("indexer.attn_q_b.weight", q).reshape(IH, ID), pos, 10000000)
+            iq = rot(
+                mv("indexer.attn_q_b.weight", q).reshape(IH, ID), position, 10000000
+            )
             weights = mv("indexer.proj.weight", z) / np.sqrt(ID * IH)
             groups = pos // P
             scores = [
@@ -345,7 +386,7 @@ def forward(token):
                 np.concatenate(
                     [linear(pre + "attn_k_b.weight", qr[h, :16], h), qr[h, 16:]]
                 ),
-                pos,
+                position,
                 10000 if l == 1 else 10000000,
             )
             keys = np.stack(c["kv"])[selected]
@@ -404,13 +445,82 @@ def forward(token):
         x += post[:, None] * f[None, :]
         traces[f"{pos}-{l}-ffn_out"] = f
         traces[f"{pos}-{l}-l_out"] = x.copy()
-    mixes = linear("output_hc_fn.weight", norm(x.flatten()))
-    gates = sig(mixes * w["output_hc_scale.weight"] + w["output_hc_base.weight"]) + 1e-6
-    hidden = norm((x * gates[:, None]).sum(axis=0), w["output_norm.weight"])
+    if draft:
+        hidden = norm(x[0], w[f"blk.{N}.nextn.shared_head_norm.weight"])
+    else:
+        mixes = linear("output_hc_fn.weight", norm(x.flatten()))
+        gates = (
+            sig(mixes * w["output_hc_scale.weight"] + w["output_hc_base.weight"]) + 1e-6
+        )
+        hidden = norm((x * gates[:, None]).sum(axis=0), w["output_norm.weight"])
     traces[f"{pos}--1-result_norm"] = hidden
-    hist.append(token)
+    active_hist.append(token)
+    active_positions.append(position)
+    last_reference_hidden = hidden.copy()
     return linear("output.weight", hidden)
 
+
+if args.reference:
+    records = bytearray(struct.pack("<II", 12, D))
+    target_logits, target_hidden, draft_logits, draft_hidden = [], [], [], []
+    for i in range(12):
+        image = 2 <= i < 6
+        token = -1 if image else i + 1
+        if image:
+            position = (2, 2 + (i - 2) // 2, 2 + (i - 2) % 2)
+            embedding = w["token_embd.weight"][30 + i] * 1.7
+        else:
+            p = i if i < 2 else i - 2
+            position = (p, p, p)
+            embedding = None
+        next_position = (2 if i < 5 else 4) if image else position[0] + 1
+        target_logits.append(forward(token, embedding, position))
+        hidden = last_reference_hidden.copy()
+        target_hidden.append(hidden)
+        candidate = -1 if image else i + 20
+        draft_position = (i + 1, i + 3, i + 5)
+        draft_logits.append(
+            forward(candidate, embedding if image else None, draft_position, hidden)
+        )
+        draft_hidden.append(last_reference_hidden.copy())
+        records += struct.pack("<i4q", token, *position, next_position)
+        records += (
+            np.zeros(D, "f4") if embedding is None else embedding.astype("f4")
+        ).tobytes()
+        records += struct.pack("<i3q", candidate, *draft_position)
+    (out / "reference-input.bin").write_bytes(records)
+    wanted = {
+        "target_logits": target_logits,
+        "target_hidden": target_hidden,
+        "draft_logits": draft_logits,
+        "draft_hidden": draft_hidden,
+    }
+    subprocess.run(
+        [
+            str(args.engine.resolve()),
+            str(model),
+            str(out / "reference-input.bin"),
+            str(out),
+        ],
+        check=True,
+    )
+    errors = {}
+    for name, values in wanted.items():
+        expected = np.stack(values).astype("f4")
+        expected.tofile(out / (name + "-expected.f32"))
+        actual = np.fromfile(out / (name + ".f32"), "f4").reshape(expected.shape)
+        errors[name] = float(np.max(abs(actual - expected)))
+        assert errors[name] < 2e-4, (name, errors[name])
+    report = {
+        "rows": 12,
+        "image_rows": 4,
+        "mtp_rows": 12,
+        "crossed_mtp_sparse_selection": TOP,
+        "maximum_errors": errors,
+    }
+    (out / "reference-result.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    raise SystemExit(0)
 
 tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 expected = np.stack([forward(t) for t in tokens])
@@ -462,7 +572,10 @@ p = subprocess.Popen(
     stdout=subprocess.PIPE,
     text=True,
 )
-assert p.stdout.readline().startswith("READY 64 stop")
+ready = p.stdout.readline()
+while ready.startswith("INFO "):
+    ready = p.stdout.readline()
+assert ready.startswith("READY 64 stop"), ready
 p.stdin.write(
     "GEN 1 top_k=1.5 1\nGEN 1 temperature=nan 1\n"
     "GEN 1 temperature=1 penalty_repeat=1e-42 penalty_last_n=64 pen_from=0 seed=1 1,2,3,4,5,6,7,8,9,10\n"

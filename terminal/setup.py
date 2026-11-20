@@ -78,6 +78,7 @@ from strata_control import engine_component
 from strata_control import sysinfo
 from strata_control.discovery import in_trash
 from strata_control import user_args
+from strata_control import hy4 as hy4_model
 
 ROOT = Path(__file__).resolve().parent
 
@@ -114,6 +115,7 @@ WIN = os.name == "nt"
 # day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops the
 # download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
+    hy4_model.REPO: hy4_model.REVISION,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "bba88856f8c3c0c9e40e45f82d05e228b814ac43",  # 2026-10-19 (the new expert-pruned shard 1)
@@ -810,11 +812,13 @@ OWN_PATH_FAMILIES = {
                "vision": True, "state_gb": 0.07}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
+OWN_PATH_FAMILIES[hy4_model.FAMILY] = hy4_model.family_definition(hf(hy4_model.REPO))
 
 # Every model file Strata downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256).  download()
 # checks the file against it as soon as it is whole (a wrong file is deleted and setup stops), and stops before the
 # download when the server's size is not the pinned one.  The files are fetched from the commits in HF_REVISIONS.
 REPO_PINS = {
+    hy4_model.REPO: hy4_model.PINS,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
@@ -8257,7 +8261,13 @@ def update_install(have: list, a) -> int:
         return 0
     pip_install(runtime_packages(),
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, textual (the screens)")
-    update_installed_engine(a.prebuilt, rebuild=bool(a.build))      # --update --build compiles it (#5214); it used to skip the engine step
+    hy4_paths = [p for p in have if json.loads(p.read_text(encoding="utf-8-sig")).get("arch") == hy4_model.ARCH]
+    if len(hy4_paths) < len(have):
+        update_installed_engine(a.prebuilt, rebuild=bool(a.build))  # the released Qwen components
+    hy4_pending = set()
+    if hy4_paths:
+        from strata_control import hy4_install
+        hy4_pending = hy4_install.update(_SetupTables(), hy4_paths)
     mtp_done: set = set()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
@@ -8265,7 +8275,11 @@ def update_install(have: list, a) -> int:
             refresh_shared_draft_vocab(cfg, mtp_done)
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
-        ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
+        if cfg_path not in hy4_pending:
+            ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
+    if hy4_pending:
+        warn("Strata's files are updated; the Hy4 engine update is still pending (see the reason above)")
+        return 0
     ver = config_engine_version(json.loads(have[0].read_text(encoding="utf-8-sig")))
     say()
     start = "START-HERE.bat" if WIN else "./setup.sh"
@@ -8350,6 +8364,26 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
         refresh_dflash2_vocab(drafting.data_dir_of(cfg["args"]), cfg.get("draft_vocab", "cjk"))
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
+    if cfg.get("arch") == hy4_model.ARCH:
+        # A native Hy4 start never enters Qwen's component upgrade, per-layer
+        # split planner or draft-pack discovery. Native capabilities are checked
+        # by the HTTP server against the actual executable before model loading.
+        if gpu is not None:
+            if cfg.get("backend") != "cuda":
+                fail("a CPU Hy4 config cannot be changed to CUDA at start; run setup with --backend cuda")
+            cfg["gpu"] = gpu if isinstance(gpu, list) else [gpu]
+            args = cfg["args"]
+            ids = ",".join(str(i) for i in range(len(cfg["gpu"])))
+            if "--cuda-devices" in args:
+                args[args.index("--cuda-devices") + 1] = ids
+            else:
+                args += ["--cuda-devices", ids]
+            write_config(cfg_path, cfg)
+        if open_browser and cfg.get("open_browser") is not False:
+            cmd.append("--open")
+        if not WIN and os.environ.get("STRATA_EXECV"):
+            os.execve(cmd[0], cmd, {**os.environ, acquisition.ENV: "1"})
+        return subprocess.call(cmd, env={**os.environ, acquisition.ENV: "1"})
     if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
         if WIN and not component:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461: also fixes a 0.1.34 install
@@ -9447,6 +9481,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
     script.  The engine places the experts itself (every one in VRAM when they fit, else the most-used ones there and
     the rest on the CPU), so there is no pack, profile or RAM budget to choose."""
+    if family == hy4_model.FAMILY:
+        from strata_control import hy4_install
+        return hy4_install.install(_SetupTables(), a, gpu=gpu, multi=multi, hip=hip, port=port)
     fam = OWN_PATH_FAMILIES[family]
     say()
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
@@ -10085,10 +10122,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
-                         "several requests at once with --parallel; docs/QWEN36.md)")
+                         "several requests at once with --parallel; docs/QWEN36.md), hy4 = Hy4-flash (native source build; docs/HY4_FLASH.md)")
     ap.add_argument("--model", type=model_alias, choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
                                                                        for m in f["models"])])))
     ap.add_argument("--context", type=int)
+    ap.add_argument("--context-pool", type=int, help="Hy4: shared KV token capacity across all slots (default: --context)")
+    ap.add_argument("--prefill-chunk", type=int, help="Hy4: prompt processing chunk size")
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
                          "interpolation) or yarn - llama.cpp's types. Omitted with a scaled context, the setup "
@@ -10234,10 +10273,10 @@ def main() -> int:
     ap.add_argument("--kv-streaming", choices=["auto", "on", "off"], default="auto",
                     help="from a 64K context: keep the KV cache in RAM and only the attention's window in VRAM (more "
                          "experts fit on the GPU); auto: when the RAM has room for it")
-    ap.add_argument("--backend", choices=["cuda", "hip", "sycl"],
+    ap.add_argument("--backend", choices=["cuda", "hip", "sycl", "cpu"],
                     help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
                          "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use), "
-                         "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
+                         "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md); cpu = Hy4 reference target only")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.output == "jsonl":
@@ -10249,6 +10288,18 @@ def main() -> int:
             return pulled
     if getattr(a, "gguf_dir", None):                   # the person's own files: their finish marks go to Strata's marks/, never beside them
         own_files_in(a.gguf_dir)
+        if not a.family:
+            from strata_control import models as own_models
+            try:
+                inspected = own_models.plan_import(str(Path(a.gguf_dir).expanduser()))
+            except (OSError, ValueError):
+                inspected = {}  # preserve the existing non-Hy4 installer diagnostics
+            if (inspected.get("metadata") or {}).get("architecture") == hy4_model.ARCH:
+                selection = inspected.get("candidate_selection") or {}
+                if inspected.get("issues") or not selection:
+                    fail("these Hy4 files are incomplete or unsupported", "; ".join(inspected.get("plain_issues") or []))
+                a.family, a.model = selection["family"], selection["model"]
+                a.gguf_dir = inspected["model_dir"]
     if getattr(a, "dsv41_package", None):              # DeepSeek's engine package: no longer offered (strata_control/retired.py)
         say("  " + retired.NOT_OFFERED)
         return 2
@@ -10407,6 +10458,38 @@ def main() -> int:
         roots = [data, *elsewhere]
         if not models_dir_given:
             a.models_dir = str(data / "models")
+
+    # Hy4 is a source-built native target with its own device admission and
+    # memory planner. CPU mode is a reference option, not a generic Qwen backend.
+    if a.backend == "cpu" and a.family != hy4_model.FAMILY:
+        fail("--backend cpu is currently available for --family hy4 only")
+    if a.family == hy4_model.FAMILY:
+        from strata_control import hy4_install
+        previous = hy4_install.previous(_SetupTables())
+        if a.backend is None and previous.get("backend") in ("cpu", "cuda"):
+            a.backend = previous["backend"]
+        if a.gpu is None and not a.gpus and previous.get("gpu") is not None:
+            cards = previous["gpu"]
+            if isinstance(cards, list):
+                a.gpus = ",".join(str(card) for card in cards)
+            else:
+                a.gpu = int(cards)
+        if a.backend not in (None, "cpu", "cuda"):
+            fail("Hy4 currently supports NVIDIA CUDA and the CPU reference backend")
+        selected = []
+        hy_gpu = None
+        if a.backend != "cpu":
+            found = gpus()
+            if not found:
+                fail("no NVIDIA GPU found; use --backend cpu for the Hy4 reference engine")
+            selected = choose_gpus(a, found)
+            hy_gpu = {**gpu_info(selected[0]), "archs": sorted({gpu_info(i)["arch"] for i in selected})}
+        if a.check:
+            say(f"  Hy4 {hy4_model.MODEL}: two pinned shards, {sum(hy4_model.PINS[n][0] for n in hy4_model.FILES) / 1e9:.1f} GB on disk.")
+            say("  Native source target: " + ("CPU reference" if a.backend == "cpu" else "CUDA on the selected cards") + "; Engram stays host mapped.")
+            say("  This check does not build, download, allocate model memory or qualify throughput.")
+            return 0
+        return hy4_install.install(_SetupTables(), a, gpu=hy_gpu, multi=selected, port=port)
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -10616,7 +10699,8 @@ def main() -> int:
         named = gguf_dir_choices(Path(a.gguf_dir), a.family, a.model)
         if len(named) == 1:
             a.family, a.model = named[0]
-            say(f"  The files in {a.gguf_dir} are {FAMILIES[a.family]['title']} {a.model}: using them (no question to answer).")
+            title = {**FAMILIES, **OWN_PATH_FAMILIES}[a.family]["title"]
+            say(f"  The files in {a.gguf_dir} are {title} {a.model}: using them (no question to answer).")
     if not a.family and not a.yes and FEED_MODELS is None:
         feed_models_setup(getattr(a, "feed", None))    # the signed feed's models, listed after the built-in ones (nothing happens when it has none)
     fams = menu_families(hip)

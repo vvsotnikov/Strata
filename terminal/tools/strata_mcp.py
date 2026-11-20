@@ -631,7 +631,8 @@ class Strata:
         out = {}
         for f, d in (getattr(s, "OWN_PATH_FAMILIES", None) or {}).items():
             out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"),
-                      "vision": bool(d.get("vision", True)), "own_path": True, **({"feed": True} if d.get("feed") else {})}
+                      "vision": bool(d.get("vision", True)), "own_path": True, **({"feed": True} if d.get("feed") else {}),
+                      **({k: d[k] for k in ("name", "arch", "source_only", "experimental", "mmproj") if k in d} if d.get("source_only") else {})}
         return out
 
     def own_size_names(self) -> list:
@@ -649,11 +650,16 @@ class Strata:
         d = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
         if not d or model not in d["models"]:
             return None
-        size_gb = d["sha256"][d["file"].format(q=model)][0] / 1e9
+        from strata_control.hy4 import model_files
+        size_gb = sum(d["sha256"][n][0] for n in model_files(d, model)) / 1e9
+        specific = d["models"][model]
         return {"about": d["models"][model]["about"], "download_gb": round(size_gb, 1), "ram_gb": d["models"][model]["ram_gb"],
                 # the routed experts are ~93% of the file (setup.own_path_parallel_fits_all); the dense part and buffers ~1 GB more
-                "arena_gb": round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
-                "engine": OWN_PATH_ENGINE, "families": (family,), "context_fit": self.own_context_fit(d, model)}
+                "arena_gb": specific.get("arena_gb", round(size_gb * 0.93, 1)), "vision": bool(d.get("vision", True)),
+                "engine": None if d.get("source_only") else OWN_PATH_ENGINE,
+                "families": (family,), "context_fit": self.own_context_fit(d, model),
+                **({k: specific[k] for k in ("memory_gb", "experimental") if k in specific}),
+                **({"source_only": True} if d.get("source_only") else {})}
 
     @staticmethod
     def own_context_fit(fam: dict, model) -> dict | None:
@@ -1378,7 +1384,7 @@ class Strata:
                 tag = (fd.get("tag", "") + m).lower()
                 # the model's files without the lookup table's file (download size minus the table) against the card's memory plus the RAM: "fits" or "may run slower"
                 # (strata_control/fit_label.py, the owner's one rule)
-                memory_gb = round(float(d["ram_gb"]) if d.get("mem_total") else float(d.get("arena_gb") or d["ram_gb"]) + 1.0, 1)      # the placement estimate (experts + dense)
+                memory_gb = round(float(d.get("memory_gb") or (float(d["ram_gb"]) if d.get("mem_total") else float(d.get("arena_gb") or d["ram_gb"]) + 1.0)), 1)
                 fit_gb = fit_label.files_gb(f, m, d)          # what the label and the Terminal's "Needs" column use
                 verdict = None
                 if ram is not None:
@@ -1388,15 +1394,16 @@ class Strata:
                               "images": d.get("vision", fd.get("vision", True)) is not False,
                               # which picture reader "pictures on" gets on this PC (strata_control/vision_reader.py, the one rule: the CPU reader
                               # under 24 GB of graphics memory, the GPU reader from 24 GB; the person can switch it per model)
-                              "images_reader": self.images_reader(vram),
+                              "images_reader": "cpu" if d.get("source_only") else self.images_reader(vram),
                               "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"),
                               # RAM + VRAM the weights need together, WITHOUT the n-gram table (that stays on the SSD): Gyro states it
                               # (mem_total), for the rest the experts plus ~1 GB for the dense part (Swift IQ2_XS: 35.5 + 1 = 36.5)
-                              "mem_total": bool(d.get("mem_total")), "multi_file": False,
+                              "mem_total": bool(d.get("mem_total")), "multi_file": bool(d.get("source_only")),
                               "disk_gb": None,
                               # the first engine that reads this size's files (setup.py "engine"); the app says "needs a newer engine"
                               # with the update step when the installed one is older. None: any engine that setup accepts.
                               "engine_min": ".".join(map(str, d["engine"])) if d.get("engine") else None,
+                              **({"source_only": True} if d.get("source_only") else {}),
                               "memory_gb": memory_gb, "fit_gb": fit_gb,
                               # Qwen3.6: the conversation memory per token and what the card holds before it (strata_control/own_path_fit.py,
                               # #5715): the app's context estimate and its warning use these; absent for every other model
@@ -1592,8 +1599,9 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
         own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)
         if own:                                         # Qwen3.6: the GGUF and the picture reader in the model's folder
             folder = Path(models_dir) / (own["tag"] + model)
-            name = own["file"].format(q=model)
-            out.append({"path": str(folder / name), "bytes": own["sha256"][name][0], "role": "model"})
+            from strata_control.hy4 import model_files
+            for name in model_files(own, model):
+                out.append({"path": str(folder / name), "bytes": own["sha256"][name][0], "role": "model"})
             if vision:
                 out.append({"path": str(folder / own["mmproj"]), "bytes": own["sha256"][own["mmproj"]][0], "role": "vision"})
             return out
@@ -2361,6 +2369,10 @@ class Tools:
             raise ToolError(f"{families[family]['title']} has no {model}; its sizes: {', '.join(sizes)}")
         md = s.own_size(family, model) or models[model]   # Qwen3.6-35B-A3B: its sizes are not in setup's MODELS
         mac = bool(hw.get("mac"))
+        if family == "hy4" and (mac or backend not in (None, "cpu", "cuda")):
+            raise ToolError("Hy4 currently requires the NVIDIA CUDA or CPU reference source target")
+        if family == "hy4" and drafter == "dflash2":
+            raise ToolError("there is no supported Hy4 DFlash2 drafter; choose mtp or switch drafting off")
         if mac:                                         # a Mac: no card to pick, no KV choice, no RAM mode: unified memory decides
             if rec.get("model") is None and model is not None and s.mac() and hw.get("ram_gb", 0) < s.mac().MIN_STREAM_RAM_GB:
                 raise ToolError(f"{model} does not fit this Mac: {rec['why']}")
@@ -2371,7 +2383,7 @@ class Tools:
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 131072                          # 128K on every card (owner, 2026-11-01; strata_control/default_context.py)
             own = (getattr(s.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
-            if own:                                   # Qwen3.6: the largest size that fits the card when 128K does not (#5715, setup's own rule)
+            if own and not own.get("source_only"):    # Qwen3.6: its per-slot GPU allocation rule; Hy4 uses a shared native pool
                 context = s.setup_module().own_path_context(own, max((g["vram_gb"] for g in usable), default=0.0), model)
         if vision in ("yes", "gpu", "cpu") and md.get("vision", families[family].get("vision")) is False:
             raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
@@ -2421,7 +2433,7 @@ class Tools:
             if not local.is_absolute() or not local.is_dir() or ".." in local.parts:
                 raise ToolError("gguf_dir must be an existing absolute folder")
             args += ["--gguf-dir", str(local)]
-        if backend in ("cuda", "hip", "sycl"):
+        if backend in ("cuda", "hip", "sycl") or (family == "hy4" and backend == "cpu"):
             args += ["--backend", backend]
         if drafter in ("mtp", "dflash2") and backend != "sycl":      # an Arc runs with no drafter the installer sets up (the Terminal's adopted config has none either)
             args += ["--drafter", drafter]
@@ -2455,6 +2467,9 @@ class Tools:
             plan["license"] = families[family]["license"]
         if families[family].get("experimental") or md.get("experimental"):
             plan["experimental"] = True
+        if families[family].get("source_only"):
+            plan["engine_source"] = "local_source_build"
+            plan["engine_note"] = "Hy4 uses strata-hy4 built from this source checkout; no published engine package is fetched"
         return plan, args
 
     def launch_install(self, plan: dict, args: list) -> dict:

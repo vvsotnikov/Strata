@@ -3,6 +3,10 @@
 This page helps you choose a model and check that your computer can run it. It covers
 Qwen3.8-Flash-Next (and its variants) and Qwen3.6-35B-A3B. For installing, see [INSTALL.md](INSTALL.md).
 
+This source fork additionally offers experimental [Hy4-flash](HY4_FLASH.md) as
+`--family hy4 --model Q4_K_M`. It builds a separate native engine from this
+checkout; release app/Terminal engine packages do not contain that target.
+
 > **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
 > [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
 > [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [Adding or switching models](#adding-or-switching-models) ·

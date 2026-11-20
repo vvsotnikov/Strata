@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@
 namespace strata::hy4 {
 
 using Vec = std::vector<float>;
+using RopePosition = std::array<int64_t, 3>;
 using Trace = std::function<void(const std::string&, int, std::span<const float>)>;
 
 struct Geometry {
@@ -52,6 +54,7 @@ private:
 
 void rms(std::span<float> x, float epsilon, std::span<const float> weight = {});
 void rope(std::span<float> x, int64_t position, float base);
+void rope(std::span<float> x, const RopePosition& position, float base);
 std::vector<int> route(std::span<const float> probabilities, std::span<const float> bias, int used);
 std::vector<int32_t> engram_hash(const Geometry& g, int module, std::span<const int32_t> history, int32_t token);
 Vec pool_key(std::span<const float> values, std::span<const float> gates,
@@ -63,8 +66,22 @@ public:
     const Geometry& geometry() const { return g_; }
     const GgufFile& metadata() const { return model_.meta(); }
     const Tensor& tensor(const std::string& name) const;
+    const std::map<std::string, Tensor>& tensors() const { return tensors_; }
     void reset();
     Vec forward(int32_t token, const Trace& trace = {});
+    Vec forward_at(int32_t token, std::optional<RopePosition> position = {},
+                   int64_t next_rope = -1, const Trace& trace = {});
+    Vec forward_embedding(std::span<const float> embedding, const RopePosition& position,
+                          int64_t next_rope = -1, const Trace& trace = {});
+    Vec draft_forward(int32_t token, std::span<const float> previous_hidden,
+                      std::optional<RopePosition> position = {}, int64_t next_rope = -1,
+                      const Trace& trace = {});
+    Vec draft_forward_embedding(std::span<const float> embedding, std::span<const float> previous_hidden,
+                                const RopePosition& position, int64_t next_rope = -1,
+                                const Trace& trace = {});
+    const Vec& last_hidden() const { return last_hidden_; }
+    const Vec& last_draft_hidden() const { return last_draft_hidden_; }
+    void reset_draft();
     const std::vector<int32_t>& history() const { return history_; }
     int64_t max_context() const { return max_context_; }
     void set_matmul(std::unique_ptr<Matmul> backend) { mm_ = std::move(backend); }
@@ -77,9 +94,13 @@ private:
     Mix mix(const Vec& x, int layer, const char* kind);
     Vec finish_mix(const Vec& residual, const Vec& value, const Vec& post);
     Vec engram(Vec x, int layer, int module, int32_t token);
-    Vec attention(const Vec& x, int layer, const Trace& trace);
+    Vec attention(const Vec& x, int layer, int64_t logical_position, const RopePosition& position,
+                  const std::vector<RopePosition>& positions, const Trace& trace);
     Vec ffn(const Vec& x, int layer, const Trace& trace);
-    std::vector<int> select(const Vec& x, const Vec& q, int layer);
+    std::vector<int> select(const Vec& x, const Vec& q, int layer, int64_t logical_position,
+                            const RopePosition& position, const std::vector<RopePosition>& positions);
+    Vec forward_row(std::span<const float>, int32_t token, const RopePosition&, int64_t, const Trace&);
+    Vec draft_row(std::span<const float>, std::span<const float>, int32_t, const RopePosition&, int64_t, const Trace&);
     Vec linear(const std::string& name, std::span<const float> x, int plane = 0);
     Vec norm(Vec x, const std::string& name, float eps = -1);
     std::string layer_name(int layer, const std::string& suffix) const;
@@ -91,6 +112,10 @@ private:
     std::unique_ptr<Matmul> mm_;
     std::vector<Cache> cache_;
     std::vector<int32_t> history_;
+    std::vector<int32_t> draft_history_;
+    std::vector<RopePosition> positions_, draft_positions_;
+    Vec last_hidden_, last_draft_hidden_;
+    int64_t next_rope_ = 0, draft_next_rope_ = 0;
     int64_t max_context_;
 };
 

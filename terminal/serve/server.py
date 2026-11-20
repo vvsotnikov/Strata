@@ -714,6 +714,7 @@ class StrataEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
+    eos_ids = EOS_IDS  # each loaded model may report its own ids; Qwen's fallback stays unchanged
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
@@ -759,10 +760,13 @@ class StrataEngine:
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        if getattr(self, "native_family", None) == "hy4" and "--model" in args:
+            self.model_path = args[args.index("--model") + 1]
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.eos_ids = set(EOS_IDS)
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold)
         self.can_hold_batch = False      # ... and its --batch slots end at the hold too, BDONE hold (READY ... holdb)
@@ -925,6 +929,8 @@ class StrataEngine:
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
+        if getattr(self, "native_family", None) == "hy4" and self.info.get("eos_ids") is not None:
+            self.eos_ids = {int(value) for value in str(self.info["eos_ids"]).split(",")}
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
@@ -938,7 +944,11 @@ class StrataEngine:
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         try:                                            # which drafter runs, and in plain words why not the one that was asked for
-            self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
+            if getattr(self, "native_family", None) == "hy4":
+                n = int(args[args.index("--mtp") + 1]) if "--mtp" in args else 0
+                self.info.update(drafting="mtp" if n else "off", drafting_note="")
+            else:
+                self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
@@ -1554,6 +1564,8 @@ class StrataEngine:
                         self.last["prompt_ms"] = (self.last.get("prompt_ms") or 0.0) + float(value)
                     except ValueError:
                         pass
+                elif eq and key == "prompt_read" and value.isdigit():
+                    self.last["prompt_read"] = int(value)  # native slot prefill's actual fresh count, including cancellation
                 elif eq and key == "drafts":                 # drafts=<checked>:<kept>: the slot's own --batch-mtp counters (#5890)
                     offered, colon, accepted = value.partition(":")
                     if colon and offered.isdigit() and accepted.isdigit():
@@ -1966,6 +1978,11 @@ class StrataEngine:
                     lines_q, sq = self.lines, self.slot_q           # (it holds no slot of the engine before: nothing to lose)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
+                if getattr(self, "native_family", None) == "hy4":
+                    # Hy4 runs MTP inside native lanes. Qwen's solo promotion
+                    # would replay output tokens as prompt work and prevent
+                    # early admission of concurrent requests.
+                    alone = False
                 if alone and left > 1 and not (not embeddings and self._turn_in_slot(prompt)):
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}"
@@ -2025,7 +2042,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length", "hold") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length", "hold") or (out and out[-1] in self.eos_ids):
                             return                          # ("hold": the budget's cut: the caller wraps up or asks for more)
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2238,7 +2255,7 @@ class StrataEngine:
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         self._raise_if_closed_under(f[3] if len(f) > 3 else None, cancel)   # #6055
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                                and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
@@ -2288,7 +2305,7 @@ class StrataEngine:
                 self._quarantine_control(undrained, born, lines_q, slot if undrained == "BADM" else None, holding)
                 holding, handed = False, True
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and same:
+            if phase == "slot" and slot is not None and out and out[-1] in self.eos_ids and same:
                 bd = self._bdone_after_eos(slot, q=sq[slot])    # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
@@ -2835,6 +2852,13 @@ class Hy4Engine(StrataEngine):
     """The native Hy4 protocol supports the complete vocabulary when top_k is disabled."""
 
     host_mmap = True
+    native_family = "hy4"
+
+    def _may_go_solo(self, left, times, embeddings):
+        return False  # native lanes already speculate; keep one timing/cache owner
+
+    def _coalesce(self, cancel, lead_prompt):
+        return None  # Qwen's BCO extension is not part of Hy4's native protocol
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -3469,6 +3493,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
+    if cfg.get("arch") == "hy_v4_flash":
+        return user_args.merge(list(cfg.get("args", [])), user_args.capture(cfg))
     # #6203: the options of "args" that differ from "args_written" were put there by hand and count the same (docs/TERMINAL_LAUNCH.md): drafting.apply below
     # reads "user_args" to know which of --spec / --draft-conf the person chose, so it gets the captured list, not only the stored one.
     mine = user_args.capture(cfg)
@@ -3755,6 +3781,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
+    if cfg.get("arch") == "hy_v4_flash" and cfg.get("backend") == "cuda" and gpu_list(cfg) and "CUDA_VISIBLE_DEVICES" not in (cfg.get("env") or {}):
+        from strata_control import hy4
+        env["CUDA_VISIBLE_DEVICES"] = hy4.cuda_visible_devices(ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
     # 0.2.17 (owner 11-19): the route tail skip is Off unless the person turned it on (STRATA_ROUTE_TAIL_SKIP=7 in the config or in their own environment).
@@ -5088,8 +5117,16 @@ class Service:
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            image_pad, vision_start = IMAGE_PAD, VISION_START
+            if self.family == "hy4":
+                from serve.hy4 import namespace_from_template
+                ns = namespace_from_template(self.template.source)
+                image_pad, vision_start = f"<｜hy_image▁pad{ns}｜>", f"<｜hy_image▁start{ns}｜>"
+            pad_ids = self.tok.encode(image_pad, parse_special=True)
+            start_ids = self.tok.encode(vision_start, parse_special=True)
+            if len(pad_ids) != 1 or len(start_ids) != 1:
+                raise ValueError("the tokenizer does not contain this model's image markers")
+            pad, start = pad_ids[0], start_ids[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5105,7 +5142,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
@@ -7967,10 +8004,55 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     normal layer-split config under "split_fallback": if that engine refuses or fails to come up, say so in one plain line and start the
     normal one instead, so a start never fails because of the option. Any other config starts exactly as before."""
     if cfg.get("arch") == "hy_v4_flash":
-        if cfg.get("parallel", 1) != 1 or cfg.get("drafting", "off") != "off" or cfg.get("vision"):
-            raise ValueError("Hy4 currently supports one text context without speculation")
-        return Hy4Engine(exe, list(cfg.get("args", [])) + list(cfg.get("user_args", [])),
-                         cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        from strata_control import hy4
+        # A saved config cannot claim features absent from the actual executable.
+        caps = hy4.capabilities(Path(exe), env=env)
+        features = caps["features"]
+        args = user_args.merge(list(cfg.get("args", [])), user_args.capture(cfg))
+        def option(name, default):
+            return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+        devices = option("--cuda-devices", "")
+        if devices and caps.get("backend") != "cuda":
+            raise ValueError("this Hy4 executable was built without CUDA")
+        if not devices:
+            if cfg.get("backend") == "cuda":
+                raise ValueError("the Hy4 CUDA configuration must select its visible device ordinals")
+            features = {key: False for key in features} | {"kv_ram": True}
+        slots = int(cfg.get("parallel", option("--slots", 1)))
+        if not 1 <= slots <= 8 or (slots > 1 and not features.get("batching")):
+            raise ValueError("this Hy4 engine does not implement the requested batch slots")
+        drafting = cfg.get("drafting", "off")
+        if drafting not in ("off", "mtp", "auto"):
+            raise ValueError("this Hy4 engine supports native MTP only; no Hy4 DFlash2 drafter is available")
+        mtp = int(option("--mtp", 2 if drafting == "mtp" else 0))
+        if cfg.get("mtp") is False or drafting == "off" or "--no-mtp" in args:
+            mtp = 0
+        if drafting == "auto" and not features.get("mtp"):
+            mtp = 0
+        if not 0 <= mtp <= 5 or (mtp and not features.get("mtp")):
+            raise ValueError("this Hy4 engine does not implement the requested MTP window")
+        if cfg.get("vision") and not features.get("vision"):
+            raise ValueError("this Hy4 engine does not implement vision")
+        if (cfg.get("vision") or {}).get("elastic") or cfg.get("vram_elastic"):
+            raise ValueError("Hy4 GPU vision uses an explicit VRAM reserve; elastic cache controls are not implemented")
+        if option("--kv-location", "ram") == "gpu" and not features.get("kv_gpu"):
+            raise ValueError("this Hy4 engine does not implement a GPU KV pool")
+        # Keep server admission and native slot count in agreement, including a
+        # launch-time --parallel override. Never append Qwen-specific flags.
+        clean, i = [], 0
+        while i < len(args):
+            if args[i] in ("--slots", "--mtp"):
+                i += 2
+            elif args[i] == "--no-mtp":
+                i += 1
+            else:
+                clean.append(args[i])
+                i += 1
+        args = clean + ["--slots", str(slots), "--mtp", str(mtp)]
+        engine = Hy4Engine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine.info["native_capabilities"] = caps
+        engine.info.update(drafting="mtp" if mtp else "off", drafting_note="")
+        return engine
     fb = cfg.get("split_fallback")
     try:
         return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
@@ -8151,6 +8233,8 @@ def apply_vision_defaults(cfg: dict) -> dict:
     A config that says "vram_elastic" itself, and AMD (no shrinking expert cache on HIP), keep the room in the reserve as before: the reserve
     setup writes for a GPU reader that stays on the card (700 MiB, or none) becomes VISION_RESERVE_MIB; a reserve the person or the app chose
     (any other number) is kept."""
+    if cfg.get("arch") == "hy_v4_flash":
+        return cfg  # Hy4 has explicit encoder budgeting, not Qwen's elastic cache protocol
     if not vision_on_demand_by_default(cfg):
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}
@@ -8359,7 +8443,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if a.parallel is not None:
         if a.parallel < 1 or a.parallel > 1024:
             ap.error("--parallel must be in 1..1024; the engine may reduce it to the supported count")
-        if parallel_flag_conflicts(cfg):
+        if cfg.get("arch") != "hy_v4_flash" and parallel_flag_conflicts(cfg):
             ap.error("--parallel conflicts with an explicit --batch/--slots in the saved engine args")
         cfg["parallel"] = a.parallel
     if a.batch_groups is not None:
@@ -8486,7 +8570,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         igpu_line = igpu_split_warning(cfg)
         if igpu_line:
             print(igpu_line, flush=True)
-        if layer_split_of(cfg):
+        if cfg.get("arch") == "hy_v4_flash" and len(gpu_list(cfg)) > 1:
+            print(f"[strata] Hy4 CUDA devices: physical GPUs {gpu_list(cfg)}; native weight placement and streaming", flush=True)
+        elif layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:

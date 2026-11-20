@@ -95,6 +95,14 @@ class Hy4Parsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             clean_shared_defaults({"reasoning_effort": "max"})
 
+    def test_native_slot_done_reports_actual_cancelled_prefill(self):
+        engine = Hy4Engine.__new__(Hy4Engine)
+        engine.batch = 0
+        engine.last = {"prompt_read": 0, "prompt_ms": 0.0, "decode_ms": 0.0}
+        engine._apply_bdone(["BDONE", "2", "0", "cancel", "0.0", "read=12.0", "prompt_read=8", "drafts=0:0"])
+        self.assertEqual(engine.last["prompt_read"], 8)
+        self.assertEqual(engine.last["prompt_ms"], 12.0)
+
     def test_top_k_not_capped_at_qwen_limit(self):
         self.assertIn(" top_k=0", Hy4Engine.sampling_keys({"top_k": 0}))
         self.assertIn(" top_k=1000", Hy4Engine.sampling_keys({"top_k": 1000}))
@@ -121,29 +129,37 @@ class Hy4Parsing(unittest.TestCase):
                 "history", template.render(messages, preserve_thinking=False)
             )
 
+    def test_tool_alias_uses_declared_string_schema(self):
+        tools = [{"name": "tools.weather", "parameters": {"properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}]
+        parser = Hy4OutputParser(thinking=False, tools=tools, declared_only=True)
+        events = parser.feed(CALL.replace("Paris", "123")) + parser.finish()
+        calls = [e.call for e in events if e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("tools.weather", {"city": "123", "days": 2})])
+
     def test_does_not_apply_qwen_flags_or_fallback(self):
-        cfg = {
-            "arch": "hy_v4_flash",
-            "args": ["--model", "hy4.gguf"],
-            "drafting": "off",
-        }
+        cfg = {"arch": "hy_v4_flash", "args": ["--model", "hy4.gguf"], "drafting": "off"}
+        caps = {"architecture": "hy_v4_flash", "backend": "cuda", "features": {}}
         with (
             patch("serve.server.Hy4Engine") as engine,
+            patch("strata_control.hy4.capabilities", return_value=caps),
             patch("serve.server.engine_args", side_effect=AssertionError("Qwen flags")),
         ):
             start_engine_or_fallback(cfg, "strata-hy4", None, {}, False, None)
-            self.assertEqual(
-                engine.call_args.args, ("strata-hy4", ["--model", "hy4.gguf"])
-            )
-        for extra in (
-            {"drafting": "mtp"},
-            {"parallel": 4},
-            {"vision": {"exe": "vision"}},
-        ):
-            with self.assertRaises(ValueError):
-                start_engine_or_fallback(
-                    cfg | extra, "strata-hy4", None, {}, False, None
-                )
+            self.assertEqual(engine.call_args.args, ("strata-hy4", ["--model", "hy4.gguf", "--slots", "1", "--mtp", "0"]))
+            for extra in ({"drafting": "mtp"}, {"parallel": 4}, {"vision": {"exe": "vision"}}):
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    start_engine_or_fallback(cfg | extra, "strata-hy4", None, {}, False, None)
+
+    def test_supported_capabilities_enable_matching_native_flags(self):
+        cfg = {"arch": "hy_v4_flash", "args": ["--cuda-devices", "0", "--slots", "1", "--mtp", "0"],
+               "parallel": 4, "drafting": "mtp", "mtp": True, "vision": {"exe": "strata-hy4-vision"}}
+        caps = {"architecture": "hy_v4_flash", "backend": "cuda", "features": {"vision": True, "mtp": True, "batching": True}}
+        with patch("serve.server.Hy4Engine") as engine, patch("strata_control.hy4.capabilities", return_value=caps):
+            start_engine_or_fallback(cfg, "strata-hy4", None, {}, False, None)
+            self.assertEqual(engine.call_args.args[1], ["--cuda-devices", "0", "--slots", "4", "--mtp", "0"])
+            # User-selected Off remains off even when an executable gains MTP.
+            start_engine_or_fallback(cfg | {"drafting": "off", "args": ["--cuda-devices", "0", "--mtp", "5"]}, "strata-hy4", None, {}, False, None)
+            self.assertEqual(engine.call_args.args[1], ["--cuda-devices", "0", "--slots", "4", "--mtp", "0"])
 
 
 if __name__ == "__main__":

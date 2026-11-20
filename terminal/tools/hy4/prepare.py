@@ -1,4 +1,4 @@
-"""Export Hy4's tokenizer and a manual native-engine serving configuration."""
+"""Prepare Hy4's native tokenizer and serving configuration (also used by setup)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 from gguf_reader import GGUFFile
+from strata_control import hy4
 from strata_tokenizer import DEEPSEEK3_PATTERNS, extract
 
 
@@ -21,22 +22,53 @@ def prepare(
     threads=4,
     cuda_devices: str | None = None,
     cuda_cache_mib: str | None = None,
+    *, expert_cache_mib: str | None = None, slots: int = 1,
+    context_pool: int | None = None, prefill_chunk: int = 8,
+    kv_location: str = "ram", kv_type: str | None = None, mmproj: Path | None = None,
+    mtp: int = 0, native_caps: dict | None = None, vision_gpu: bool = False,
+    vram_reserve_mib: int | None = None,
 ):
     if not engine.is_file():
         raise ValueError(f"native engine not found: {engine}")
-    if (cuda_devices is None) != (cuda_cache_mib is None):
-        raise ValueError("provide both --cuda-devices and --cuda-cache-mib")
+    caps = native_caps if native_caps is not None else hy4.capabilities(engine)
+    features = caps.get("features") or {}
+    if cuda_devices is None:
+        # This executable's CUDA features require a selected device path. A
+        # no-device start is the serial CPU reference, including in CUDA builds.
+        features = {key: False for key in features} | {"kv_ram": True}
+    if kv_type is None:
+        kv_type = "f16" if cuda_devices is not None else "f32"
+    if cuda_devices is None and kv_type != "f32":
+        raise ValueError("the Hy4 CPU reference stores KV in F32")
+    if cuda_devices is None and (cuda_cache_mib is not None or expert_cache_mib is not None):
+        raise ValueError("CUDA weight budgets require --cuda-devices")
     if cuda_devices is not None:
         devices = [int(x) for x in cuda_devices.split(",")]
-        budgets = [int(x) for x in cuda_cache_mib.split(",")]
-        if (
-            len(devices) != len(budgets)
-            or len(set(devices)) != len(devices)
-            or min(devices + budgets) < 0
-        ):
-            raise ValueError(
-                "CUDA devices must be unique and have one nonnegative MiB budget each"
-            )
+        if not devices or min(devices) < 0 or len(set(devices)) != len(devices):
+            raise ValueError("CUDA devices must be unique nonnegative ordinals")
+        for budget in (cuda_cache_mib, expert_cache_mib):
+            if budget is not None:
+                values = [int(x) for x in budget.split(",")]
+                if len(values) != len(devices) or min(values) < 0:
+                    raise ValueError("provide one nonnegative MiB weight budget per CUDA device")
+        if caps.get("backend") != "cuda":
+            raise ValueError("this Hy4 executable was built without CUDA")
+    if type(slots) is not int or not 1 <= slots <= 8:
+        raise ValueError("slots must be 1..8")
+    if slots > 1 and not features.get("batching"):
+        raise ValueError("this Hy4 engine does not implement batched serving")
+    if not 1 <= prefill_chunk <= 8 or kv_location not in ("ram", "gpu") or kv_type not in ("f16", "f32"):
+        raise ValueError("unsupported Hy4 prefill or KV setting")
+    if kv_location == "gpu" and (cuda_devices is None or not features.get("kv_gpu")):
+        raise ValueError("this Hy4 engine does not support a GPU KV pool")
+    if type(mtp) is not int or not 0 <= mtp <= 5 or (mtp and not features.get("mtp")):
+        raise ValueError("this Hy4 engine does not support the requested MTP window")
+    if mmproj is not None and (not mmproj.is_file() or not features.get("vision")):
+        raise ValueError("vision requires the Hy4 projector and a vision-capable Hy4 engine")
+    if vision_gpu and (mmproj is None or cuda_devices is None):
+        raise ValueError("GPU vision requires a CUDA model configuration and its projector")
+    if vram_reserve_mib is not None and (type(vram_reserve_mib) is not int or vram_reserve_mib < 0):
+        raise ValueError("VRAM reserve must be nonnegative MiB")
     g = GGUFFile(model)
     if g.metadata.get("general.architecture") != "hy_v4_flash":
         raise ValueError("expected a hy_v4_flash GGUF")
@@ -47,6 +79,11 @@ def prepare(
         or not 1 <= threads <= 256
     ):
         raise ValueError("context or CPU thread count out of range")
+    pool = context if context_pool is None else context_pool
+    if type(pool) is not int or not context <= pool <= slots * g.metadata["hy_v4_flash.context_length"]:
+        raise ValueError("shared context pool must cover one request and fit the configured slots")
+    if cuda_devices is None and pool != context:
+        raise ValueError("the Hy4 CPU reference has one context, not a shared KV pool")
     output.mkdir(parents=True, exist_ok=True)
     tk = extract(model, output)
     tk.pop("pre_pattern", None)
@@ -65,11 +102,16 @@ def prepare(
             str(threads),
             "--max-context",
             str(context),
+            "--context-pool", str(pool), "--slots", str(slots),
+            "--prefill-chunk", str(prefill_chunk), "--kv-location", kv_location,
+            "--kv-type", kv_type, "--mtp", str(mtp),
         ],
         "arch": "hy_v4_flash",
         "model_name": "hy4-flash",
         "backend": "cpu",
-        "parallel": 1,
+        "parallel": slots,
+        "context_pool": pool,
+        "native_capabilities": caps,
         "tokenizer": str((output / "tokenizer").resolve()),
         "log": str((output / "engine.log").resolve()),
         "reasoning_effort": "max",
@@ -77,17 +119,27 @@ def prepare(
         "answer_room": False,
         "sampling": {"temperature": 0.9, "top_p": 1.0},
         "fit_max_tokens": False,
-        "drafting": "off",
+        "drafting": "mtp" if mtp else "off",
+        "mtp": bool(mtp),
         "engine_ready_s": 900,
     }
     if cuda_devices is not None:
         cfg["backend"] = "cuda"
-        cfg["args"] += [
-            "--cuda-devices",
-            cuda_devices,
-            "--cuda-cache-mib",
-            cuda_cache_mib,
-        ]
+        cfg["args"] += ["--cuda-devices", cuda_devices]
+        if cuda_cache_mib is not None:
+            cfg["args"] += ["--cuda-cache-mib", cuda_cache_mib]
+        if expert_cache_mib is not None:
+            cfg["args"] += ["--expert-cache-mib", expert_cache_mib]
+    if vram_reserve_mib is not None:
+        cfg["args"] += ["--vram-reserve-mib", str(vram_reserve_mib)]
+    if mmproj is not None:
+        reader = engine.with_name("strata-hy4-vision" + (".exe" if engine.suffix == ".exe" else ""))
+        if not reader.is_file():
+            raise ValueError("the Hy4 vision encoder executable is missing; build strata-hy4-vision")
+        cfg["args"] += ["--mmproj", str(mmproj.resolve())]
+        cfg["vision"] = {"exe": str(reader.resolve()), "mmproj": str(mmproj.resolve()),
+                         "model": str(model.resolve()), "gpu": bool(vision_gpu), "threads": threads,
+                         "max_tokens": 1024 if vision_gpu else 300}
     path = output / "serve.json"
     path.write_text(json.dumps(cfg, indent=2) + "\n")
     return path
@@ -107,6 +159,16 @@ if __name__ == "__main__":
         "--cuda-cache-mib",
         help="dense weight budget per selected device, e.g. 8192,8192",
     )
+    p.add_argument("--expert-cache-mib")
+    p.add_argument("--vram-reserve-mib", type=int)
+    p.add_argument("--slots", type=int, default=1)
+    p.add_argument("--context-pool", type=int)
+    p.add_argument("--prefill-chunk", type=int, default=8)
+    p.add_argument("--kv-location", choices=("ram", "gpu"), default="ram")
+    p.add_argument("--kv-type", choices=("f16", "f32"))
+    p.add_argument("--mtp", type=int, default=0)
+    p.add_argument("--mmproj", type=Path)
+    p.add_argument("--vision-gpu", action="store_true")
     a = p.parse_args()
     print(
         prepare(
@@ -117,5 +179,8 @@ if __name__ == "__main__":
             a.threads,
             a.cuda_devices,
             a.cuda_cache_mib,
+            expert_cache_mib=a.expert_cache_mib, slots=a.slots, context_pool=a.context_pool,
+            prefill_chunk=a.prefill_chunk, kv_location=a.kv_location, kv_type=a.kv_type,
+            mmproj=a.mmproj, mtp=a.mtp, vision_gpu=a.vision_gpu, vram_reserve_mib=a.vram_reserve_mib,
         )
     )

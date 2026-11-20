@@ -99,7 +99,7 @@ class Hy4OutputParser(JsonOutputParser):
                     call = parse_call(
                         raw[len(self.hy_call) : -len(self.hy_end)],
                         self.namespace,
-                        self.schemas,
+                        self.schemas | {alias: self.schemas[name] for alias, name in self.aliases.items()},
                     )
                 except ValueError:
                     events.append(
@@ -108,6 +108,7 @@ class Hy4OutputParser(JsonOutputParser):
                         )
                     )
                 else:
+                    call["name"] = self.aliases.get(call["name"], call["name"])
                     events.extend(
                         super().feed(
                             "<tool_call>"

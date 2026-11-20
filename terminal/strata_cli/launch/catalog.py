@@ -437,6 +437,9 @@ class Catalog:
 
     def contexts_for(self, family: str | None, model: str | None = None) -> list[int]:
         """The context sizes to offer for this model: the shared list."""
+        if family == "hy4":
+            from strata_control.hy4 import CONTEXTS
+            return list(CONTEXTS)
         return self.contexts()
 
     def recommendation(self, hw: dict | None = None) -> dict:
@@ -514,7 +517,7 @@ class Catalog:
     def resolve(self, model: str, family: str | None = None) -> tuple[str, str]:
         """`iq3_xxs` or `IQ3_XXS` (and an optional family) -> (family, model); raises ValueError with the closest match."""
         models, families, _ctx, _src = self.tables()
-        names = list(models)
+        names = list(dict.fromkeys([*models, *getattr(self.strata, "own_size_names", list)()]))
         match = next((n for n in names if n.lower() == model.lower()), None)
         if match is None:
             near = S.closest(model, names)

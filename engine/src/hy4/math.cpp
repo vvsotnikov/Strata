@@ -104,10 +104,17 @@ void rms(std::span<float> x, float epsilon, std::span<const float> weight) {
 }
 
 void rope(std::span<float> x, int64_t position, float base) {
-    if (x.size() % 2 || base <= 0 || position < 0) throw std::runtime_error("hy4: invalid RoPE inputs");
+    rope(x, RopePosition{position, position, position}, base);
+}
+
+void rope(std::span<float> x, const RopePosition& position, float base) {
+    if (x.size() % 2 || base <= 0 || !std::isfinite(base) ||
+        std::any_of(position.begin(), position.end(), [](int64_t p) { return p < 0; }))
+        throw std::runtime_error("hy4: invalid RoPE inputs");
     const size_t half = x.size() / 2;
     for (size_t i = 0; i < half; ++i) {
-        const float angle = static_cast<float>(position) * std::pow(base, -2.0f * float(i) / float(x.size()));
+        const size_t axis = i < 30 && i % 3 == 1 ? 1 : i < 30 && i % 3 == 2 ? 2 : 0;
+        const float angle = static_cast<float>(position[axis]) * std::pow(base, -2.0f * float(i) / float(x.size()));
         const float c = std::cos(angle), s = std::sin(angle), a = x[2 * i], b = x[2 * i + 1];
         x[2 * i] = a * c - b * s;
         x[2 * i + 1] = a * s + b * c;
