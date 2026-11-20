@@ -21,6 +21,8 @@ def tool_format(source: str) -> str:
     """The tool-call form `source` (a chat template's Jinja text) tells the model to write."""
     if not isinstance(source, str) or not source:
         return "none"
+    if "HYTK" in source and "<｜hy_start" in source and "<arg_key" in source:
+        return "hy4"
     if _DSML in source:
         return "dsml"
     has_call = "<tool_call>" in source
@@ -37,6 +39,10 @@ def thinking_tags(source: str) -> dict:
     """The reasoning tags the template mentions: whether it writes `<think>` itself (into the generation prompt) and takes an
     `enable_thinking` switch."""
     src = source if isinstance(source, str) else ""
+    if tool_format(src) == "hy4":
+        return {"has_think_tags": "<think{}>" in src and "</think{}>" in src,
+                "enable_thinking_switch": False,
+                "generation_prompt_opens_think": "add_generation_prompt" in src and "think_begin_token" in src}
     return {"has_think_tags": "<think>" in src and "</think>" in src,
             "enable_thinking_switch": "enable_thinking" in src,
             "generation_prompt_opens_think": bool(re.search(r"add_generation_prompt.*?<think>", src, re.S))}

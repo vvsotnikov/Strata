@@ -813,7 +813,8 @@ class StrataEngine:
             print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
-        oomd_pacer.make_room(args)                       # Linux desktop: the file cache an earlier start left is dropped first, so the engine's RAM is free (serve/oomd_pacer.py)
+        if not getattr(self, "host_mmap", False):
+            oomd_pacer.make_room(args)                   # GPU engines copy weights; a host-mapped model needs these cached pages
         spawned_at = time.monotonic()
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
@@ -2830,6 +2831,26 @@ class StrataEngine:
                 self.progress_ms, self.reused = 0, 0
 
 
+class Hy4Engine(StrataEngine):
+    """The native Hy4 protocol supports the complete vocabulary when top_k is disabled."""
+
+    host_mmap = True
+
+    @staticmethod
+    def sampling_keys(sampling: dict) -> str:
+        if sampling.get("strata_tune") or sampling.get("logit_bias") or top_logprobs(sampling) is not None:
+            raise ValueError("Hy4 tuning keys, logit bias and logprobs are not implemented")
+        cleaned = {k: v for k, v in sampling.items() if not k.startswith("strata_")}
+        keys = StrataEngine.sampling_keys(cleaned)
+        tk = sampling.get("top_k")
+        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
+            keys = re.sub(r" top_k=\d+", f" top_k={tk}", keys)
+        return keys
+
+    def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
+        return f" pen_from={orig_len - 1}" if prompt_len > orig_len else ""
+
+
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 
 
@@ -3996,6 +4017,17 @@ class Service:
         self.family = family
         import serve.frontend as _frontend
         _frontend.use_family(family)
+        if family == "hy4":
+            from serve.hy4 import force_text, namespace_from_template
+            namespace = namespace_from_template(self.template.source)
+            self._force_text = lambda force: force_text(force, namespace)
+            special = getattr(self.tok, "special_ids", {}) or {}
+            eos = special.get("eos", special.get("tokenizer.ggml.eos_token_id"))
+            if eos is None:
+                raise ValueError("Hy4 tokenizer does not declare eos_token_id")
+            self.stop_ids = {int(eos)}
+        else:
+            self._force_text = None
 
     _force_text = None
 
@@ -5732,6 +5764,9 @@ class Service:
                         if wrap:
                             budget = st["thinking_budget"] = None
                             text = REASONING_WRAP_UP + (force or "")
+                            if self.family == "hy4":
+                                from serve.hy4 import namespace_from_template
+                                text = text.replace(THINK_END, f"</think{namespace_from_template(self.template.source)}>")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -7931,6 +7966,11 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     """Start the run config's engine. A config written for the all-cards split engine (strata_control/split_engine.py) carries the
     normal layer-split config under "split_fallback": if that engine refuses or fails to come up, say so in one plain line and start the
     normal one instead, so a start never fails because of the option. Any other config starts exactly as before."""
+    if cfg.get("arch") == "hy_v4_flash":
+        if cfg.get("parallel", 1) != 1 or cfg.get("drafting", "off") != "off" or cfg.get("vision"):
+            raise ValueError("Hy4 currently supports one text context without speculation")
+        return Hy4Engine(exe, list(cfg.get("args", [])) + list(cfg.get("user_args", [])),
+                         cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
     fb = cfg.get("split_fallback")
     try:
         return StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
@@ -8512,7 +8552,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(None)
+        svc.set_family("hy4" if svc.model_arch == "hy_v4_flash" else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
