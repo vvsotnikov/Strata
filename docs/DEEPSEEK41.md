@@ -140,6 +140,9 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   `STRATA_DS4_PICTURE_KEEP` (8) is how many pictures' encodings are kept. After each request the engine writes a `CACHE` line
   (entries and bytes in RAM and in the folder, the caps, shared starts, pictures, scopes, and what was given up for room); the
   server shows it under `conversation_cache.kept` in `/metrics`.
+  A request can keep nothing (`GEN ... keep=0`, which the server sends for `"prompt_cache_retention": "none"`): it reuses no
+  kept state, keeps no conversation, shared start, restore point or picture, and its state in the model is dropped when it
+  ends. The conversation it takes the model from is set aside as usual.
 
 Pictures are on by default: the engine reads them with its own vision tower (no separate picture reader). The tower waits in RAM (about 1 GB of pinned
 memory) and takes its 319 MiB of graphics memory only while a picture is being read, out of the room `--reserve-mib` keeps free; the experts get that room

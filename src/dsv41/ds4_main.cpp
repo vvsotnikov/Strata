@@ -24,6 +24,8 @@
 // `scope=<id>` on a GEN names the request's cache scope (the server's tenant; none: the empty scope).  Every reuse
 // above stays inside it: a request never goes on from a state, a kept conversation, a shared start or a picture that
 // a request of another scope read, so neither its reused count nor its speed says what another scope sent.
+// `keep=0` on a GEN is a request that keeps nothing: it reuses no kept state (its reused count is 0), keeps no
+// conversation, shared start, restore point or picture, and its state in the model is dropped when it ends.
 #if defined(__APPLE__)
 #include <execinfo.h>
 #include <csignal>
@@ -365,6 +367,9 @@ struct Req {
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     std::string scope;  // scope=<id>: the only requests whose kept state this one may go on from, and the reverse
+    // keep=0: the request reuses nothing kept and leaves nothing behind - no conversation set aside, no shared start,
+    // no restore point, no picture's rows; its state in the model is dropped when it ends
+    bool keep = true;
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -463,7 +468,12 @@ struct SpanCache {
     };
     std::deque<std::pair<Key, std::shared_ptr<const std::vector<uint16_t>>>> q;
     std::shared_ptr<const std::vector<uint16_t>> get(strata::ds4::Model& m, const std::string& scope, const Pic& p,
-                                                     std::string& err) {
+                                                     std::string& err, bool store = true) {
+        if (!store) {   // (keep=0: encoded for this request alone, never looked up or kept)
+            auto rows = std::make_shared<std::vector<uint16_t>>();
+            if (!m.encode_image(p.rgb.data(), p.width, p.height, *rows, err)) return nullptr;
+            return rows;
+        }
         for (size_t i = 0; i < q.size(); ++i)
             if (q[i].first.hash == p.hash && q[i].first.scope == scope) {
                 auto r = q[i].second;
@@ -534,6 +544,12 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "rid") r.rid = std::atoll(v.c_str());
         else if (k == "scope") r.scope = v;
+        else if (k == "keep") r.keep = std::atoi(v.c_str()) != 0;
+    }
+    if (!r.keep) {   // (keep=0: no restore point or shared start is kept for it)
+        r.marks.clear();
+        r.tail = r.shared = -1;
+        r.pin = 0;
     }
     // (a scope the engine could not keep is refused: read as no scope, it would join the requests that name none)
     return !r.ids.empty() && (!geni || !r.file.empty()) && strata::ds4::slotmeta::scope_ok(r.scope);
@@ -591,6 +607,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::vector<std::string> seq_scope((size_t) std::max(1, m.seq_count()));
     const auto state_scope = [&]() -> std::string& { return seq_scope[(size_t) m.seq_bound()]; };
     std::fprintf(stderr, "ds4 serve: cache scopes on: a request reuses only what its own scope read (GEN scope=<id>)\n");
+    std::fprintf(stderr, "ds4 serve: cache opt-out on: a request with keep=0 reuses nothing and leaves nothing kept\n");
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
@@ -1147,6 +1164,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.reset();
             held.clear();
         }
+        if (!r.keep) {   // (keep=0: the conversation in the model is set aside for its own scope as for any other
+            if (held.empty()) slot_put("");   //  request; this one starts from nothing)
+            m.reset();
+            held.clear();
+        }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
         // (the state another scope read shares nothing with this prompt, whatever its tokens: it is set aside for its
@@ -1179,14 +1201,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
             if (held.empty()) slot_put("");
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
-            const int64_t rs = mine ? m.restorable(limit) : -1;   // (another scope's state: none of its checkpoints)
+            // (another scope's state: none of its checkpoints; keep=0: nothing kept is read)
+            const int64_t rs = mine && r.keep ? m.restorable(limit) : -1;
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation only
             //  when it covers more than either)
-            const int pi = prefix_find(r.ids, r.scope, pics, rs > 0 ? (size_t) rs : 0);
+            const int pi = r.keep ? prefix_find(r.ids, r.scope, pics, rs > 0 ? (size_t) rs : 0) : -1;
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
             const size_t back =
-                pics.empty() ? slot_take(r.ids, r.scope, std::max(rs > 0 ? (size_t) rs : 0, plen), whole) : 0;
+                pics.empty() && r.keep ? slot_take(r.ids, r.scope, std::max(rs > 0 ? (size_t) rs : 0, plen), whole)
+                                       : 0;
             if (back > 0) {
                 from = back;
                 took = true;
@@ -1218,7 +1242,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 for (const Pic& x : held)
                     if (x.start == q.start && x.hash == q.hash) q.len = x.len;
                 if (q.len > 0 && (size_t) q.start + q.len <= from) continue;
-                std::shared_ptr<const std::vector<uint16_t>> rows = spans.get(m, r.scope, q, err);
+                std::shared_ptr<const std::vector<uint16_t>> rows = spans.get(m, r.scope, q, err, r.keep);
                 if (!rows) {
                     ok = false;
                     break;
@@ -1374,7 +1398,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (ok && keep_start && inner.front().second && (int64_t) inner.front().first == cuts[0].pos) {
                     bool pic = false;
                     for (const Pic& q : pics) pic = pic || (int64_t) q.start < cuts[0].pos;
-                    if (!pic) prefix_keep((size_t) cuts[0].pos);
+                    if (!pic && r.keep) prefix_keep((size_t) cuts[0].pos);
                 }
             } else if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
@@ -1410,7 +1434,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // (a shared start read from token 0 with no stop before it: kept apart for new conversations, #607)
                 bool pic = false;
                 for (const Pic& q : pics) pic = pic || (size_t) q.start < done;
-                if (sh && from == 0 && next_cut == 1 && !pic) prefix_keep();
+                if (sh && from == 0 && next_cut == 1 && !pic && r.keep) prefix_keep();
             }
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
@@ -1596,10 +1620,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
-        if (nan_stop) {   // (its state holds the NaNs: the next request starts from nothing)
+        if (nan_stop || !r.keep) {   // (NaNs in the state, or keep=0: the next request starts from nothing)
             m.reset();
             held.clear();
         }
+        if (!r.keep) state_scope().clear();
         m.save_profile();
     }
     // ---- SEVERAL CONVERSATIONS AT ONCE (--parallel <n>: READY ... multi=<n>).  GEN lines carry rid=<id>, and every
@@ -1674,6 +1699,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         };
         const auto release = [&](const Act& a) {   // (its conversation free for the next request)
+            if (!a.r.keep) {   // (keep=0: its state goes with it, so nothing can set it aside later)
+                bind(a.seq);
+                m.reset();
+                held.clear();
+                state_scope().clear();
+            }
             seq_rid[(size_t) a.seq] = -1;
             seq_used[(size_t) a.seq] = ++use_clock;
             in.forget(a.r.rid);
@@ -1936,7 +1967,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 bind(s);
                 const auto& st = m.tokens();
                 size_t c = 0;   // (another scope's state counts as sharing nothing: prompt_begin reads none of it)
-                while (state_scope() == r.scope && c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+                while (r.keep && state_scope() == r.scope && c < st.size() && c < r.ids.size() && st[c] == r.ids[c])
+                    ++c;
                 int64_t u = 0;
                 if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
                 else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));

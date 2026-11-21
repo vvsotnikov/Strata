@@ -313,6 +313,51 @@ class Scopes(unittest.TestCase):
                 e.quit()
 
 
+    def test_a_request_that_keeps_nothing_reuses_nothing(self):
+        e = self.engine()
+        p = prompt(200, 2000)
+        self.assertEqual(e.gen(p, "aaaa", " keep=0"), 0)
+        self.assertEqual(e.gen(p, "aaaa", " keep=0"), 0)            # its repeat: nothing was left to reuse
+        self.assertEqual(e.gen(p, "aaaa"), 0)                       # nor for the scope's next request
+        self.assertEqual(e.gen(p, "aaaa"), len(p) - 1)              # which keeps as before
+        self.assertEqual(e.gen(p + prompt(201, 100), "aaaa", " keep=0"), 0)   # what the scope kept is not read
+        # (and not lost: the scope's own conversation was set aside, not dropped, when the request took the model)
+        self.assertGreaterEqual(e.gen(p + prompt(202, 100), "aaaa"), len(p) - 1)
+
+    def test_a_request_that_keeps_nothing_leaves_nothing(self):
+        e = self.engine({"STRATA_DS4_SLOT_CAP": "1"})
+        start = prompt(210, 1500)
+        for i in range(6):                               # more than the model holds, so each would be set aside
+            self.assertEqual(e.gen(start + prompt(211 + i, 600), "aaaa", " keep=0 shared=1500 marks=1600 tail=2000"), 0)
+        for i in range(5):                               # other requests take every conversation of the model
+            self.assertEqual(e.gen(prompt(220 + i, 2000), "bbbb", " keep=0"), 0)
+        c = e.cache
+        self.assertEqual((c["ram"], c["folder"], c["starts"], c["scopes"], c["saved"], c["taken"]), (0, 0, 0, 0, 0, 0))
+        self.assertEqual(os.listdir(os.path.join(self.dir, "slots")), [])
+        self.assertEqual(e.gen(start + prompt(211, 600), "aaaa"), 0)          # no shared start or restore point
+        e.quit()                                         # (the engine's end writes what the model holds: that one only)
+        e = self.engine()
+        self.assertEqual(e.gen(prompt(225, 2000), "cccc"), 0)
+        self.assertTrue(any(": 1 conversation(s) kept from earlier runs" in n for n in e.notes), e.notes)
+
+    def test_a_picture_of_a_request_that_keeps_nothing_is_not_kept(self):
+        log = os.path.join(self.dir, "encodes.log")
+        e = self.engine({"DS4_FAKE_ENCODE_LOG": log})
+        pictures = os.path.join(self.dir, "pictures.dsi")
+        with open(pictures, "wb") as f:
+            f.write(b"DSI1" + struct.pack("<i", 1) + struct.pack("<qii", 5, 2, 2) + bytes(12))
+
+        def ask(seed, keys=""):
+            ids = prompt(seed, 5) + [IMAGE_TOKEN] * SPAN + prompt(seed + 1, 40)
+            self.assertEqual(e.gen(ids, "aaaa", keys, pictures=pictures), 0)
+            with open(log) as f:
+                return len(f.readlines())
+        self.assertEqual(ask(230, " keep=0"), 1)
+        self.assertEqual(ask(232, " keep=0"), 2)          # encoded again: its rows were not kept
+        self.assertEqual(ask(234), 3)                      # nor for the scope's next request
+        self.assertEqual(ask(236), 3)                      # whose rows are kept as before
+
+
 class ParallelScopes(Scopes):
     parallel = 4
 
