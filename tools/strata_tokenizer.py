@@ -20,6 +20,7 @@ import json
 import pathlib
 import sys
 import threading
+import time
 
 import regex
 
@@ -423,19 +424,33 @@ class PromptEncoder:
     prompts of its own scope, so how long an encode takes says nothing about what another scope sent.  When `keep`
     is reached the scope that keeps the most gives up its least recently used prompt (gives_way), so a scope that
     fills the encoder - with requests or with token counts - makes room out of its own prompts.
+
+    `ttl_s` (0: none): a kept prompt unused for that many seconds is deleted - by `expire()`, which a server calls on
+    a timer, and before every encode, so none past its time is reused.
     """
 
-    def __init__(self, tok, keep: int = 4):
-        self.tok, self.keep = tok, keep
-        # (text, plain spans, ids, mark ends, mark counts, scope)
-        self.entries: list[tuple[str, tuple, list[int], list[int], list[int], str]] = []
+    def __init__(self, tok, keep: int = 4, ttl_s: float = 0):
+        self.tok, self.keep, self.ttl_s = tok, keep, ttl_s
+        # (text, plain spans, ids, mark ends, mark counts, scope, [last use: time.monotonic()])
+        self.entries: list[tuple[str, tuple, list[int], list[int], list[int], str, list[float]]] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
 
+    def expire(self, now: float | None = None) -> int:
+        """Delete the kept prompts unused for ttl_s: how many."""
+        if self.ttl_s <= 0:
+            return 0
+        cutoff = (time.monotonic() if now is None else now) - self.ttl_s
+        with self.lock:
+            kept = [e for e in self.entries if e[6][0] >= cutoff]
+            gone, self.entries = len(self.entries) - len(kept), kept
+        return gone
+
     def encode(self, text: str, plain=(), store: bool = True, scope: str = "") -> list[int]:
         plain = tuple(sorted(plain))
+        self.expire()
         with self.lock:
-            entries = self.entries                      # replaced, never changed in place
+            entries = self.entries                      # replaced, never changed in place (but for the last-use time)
         margin = self.tok.max_special_len - 1
         src, cut_k = None, -1
         for e in entries:
@@ -445,6 +460,8 @@ class PromptEncoder:
             k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
             if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
                 src, cut_k = e, k
+        if src is not None:
+            src[6][0] = time.monotonic()               # (used: its time starts again)
         if src is None:
             ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
             ends, counts = [m[0] for m in marks], [m[1] for m in marks]
@@ -466,7 +483,7 @@ class PromptEncoder:
             kept = [e for e in self.entries if e is not old]
             while kept and len(kept) > self.keep - 1:
                 kept.pop(self.gives_way(kept, scope))
-            self.entries = [(text, plain, ids, ends, counts, scope)] + kept
+            self.entries = [(text, plain, ids, ends, counts, scope, [time.monotonic()])] + kept
         return list(ids)
 
     @staticmethod

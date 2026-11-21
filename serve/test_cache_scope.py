@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
@@ -20,11 +21,13 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import serve.frontend as frontend  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (CACHE_SCOPE_KEY, CACHE_SCOPE_MAX, ByteTokenizer, MockEngine, Service, StrataEngine,  # noqa: E402
-                          cache_scope, conversation_cache_view, parse_cache_line, prompt_keep_setting, serve)
+from serve.server import (CACHE_RETENTION_KEY, CACHE_SCOPE_KEY, CACHE_SCOPE_MAX, ByteTokenizer, MockEngine,  # noqa: E402
+                          Service, StrataEngine, cache_off, cache_scope, cache_ttl_setting, conversation_cache_view,
+                          parse_cache_line, prompt_keep_setting, serve)
 from strata_tokenizer import PromptEncoder  # noqa: E402
 
 BAD = (5, 1.5, True, False, "", [], ["a"], {"id": "a"}, "x" * (CACHE_SCOPE_MAX + 1))
+BAD_RETENTION = (5, True, False, "", "None", "off", "0", [], {"none": 1})
 
 
 def scope_keys(**sampling):
@@ -59,6 +62,25 @@ class Keys(unittest.TestCase):
                 cache_scope({CACHE_SCOPE_KEY: bad})
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, CACHE_SCOPE_KEY):
                 StrataEngine.sampling_keys({CACHE_SCOPE_KEY: bad})
+
+
+class CacheOff(unittest.TestCase):
+    """"prompt_cache_retention": "none": the engine is told to keep nothing (keep=0); OpenAI's own values change nothing."""
+
+    def test_none_asks_the_engine_to_keep_nothing(self):
+        self.assertTrue(cache_off({CACHE_RETENTION_KEY: "none"}))
+        line = StrataEngine.sampling_keys({CACHE_RETENTION_KEY: "none", CACHE_SCOPE_KEY: "one"})
+        self.assertEqual(line.split().count("keep=0"), 1)
+        for same in ({}, {CACHE_RETENTION_KEY: None}, {CACHE_RETENTION_KEY: "in_memory"}, {CACHE_RETENTION_KEY: "24h"}):
+            self.assertFalse(cache_off(same), same)
+            self.assertNotIn("keep=", StrataEngine.sampling_keys(same))
+
+    def test_what_is_not_a_retention_is_refused_not_read_as_cache_on(self):
+        for bad in BAD_RETENTION:
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, CACHE_RETENTION_KEY):
+                cache_off({CACHE_RETENTION_KEY: bad})
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, CACHE_RETENTION_KEY):
+                StrataEngine.sampling_keys({CACHE_RETENTION_KEY: bad})
 
 
 class Encoder(unittest.TestCase):
@@ -135,6 +157,53 @@ class Encoder(unittest.TestCase):
         self.assertEqual(enc.last_reused, 0)
         enc.encode(self.TEXT + " more", store=False, scope="one")
         self.assertGreater(enc.last_reused, 0)
+
+
+class Expiry(unittest.TestCase):
+    """STRATA_CACHE_TTL_MINUTES: a kept prompt unused for that long is deleted, not only skipped."""
+    TEXT = Encoder.TEXT
+
+    def test_the_setting_is_minutes(self):
+        self.assertEqual(cache_ttl_setting({"STRATA_CACHE_TTL_MINUTES": "60"}), 3600.0)
+        self.assertEqual(cache_ttl_setting({"STRATA_CACHE_TTL_MINUTES": "0.5"}), 30.0)
+        for off in ({}, {"STRATA_CACHE_TTL_MINUTES": ""}, {"STRATA_CACHE_TTL_MINUTES": "0"},
+                    {"STRATA_CACHE_TTL_MINUTES": "-1"}, {"STRATA_CACHE_TTL_MINUTES": "soon"},
+                    {"STRATA_CACHE_TTL_MINUTES": "inf"}):
+            self.assertEqual(cache_ttl_setting(off), 0.0, off)
+
+    def test_a_prompt_past_its_time_is_deleted_and_not_reused(self):
+        tok = ByteTokenizer()
+        enc = PromptEncoder(tok, ttl_s=60)
+        enc.encode(self.TEXT, scope="one")
+        self.assertEqual(enc.expire(), 0)
+        self.assertEqual(enc.expire(time.monotonic() + 61), 1)
+        self.assertEqual(enc.entries, [])
+        enc.encode(self.TEXT, scope="one")
+        enc.entries[0][6][0] -= 61                       # (unused for longer than its time)
+        self.assertEqual(enc.encode(self.TEXT + " more", scope="one"), tok.encode(self.TEXT + " more", True))
+        self.assertEqual(enc.last_reused, 0)
+        self.assertEqual(len(enc.entries), 1)            # the old one is gone, not just passed over
+
+    def test_a_use_starts_its_time_again(self):
+        tok = ByteTokenizer()
+        enc = PromptEncoder(tok, ttl_s=60)
+        enc.encode(self.TEXT, scope="one")
+        enc.entries[0][6][0] -= 50
+        enc.encode(self.TEXT + " more", store=False, scope="one")      # a count reads it
+        self.assertGreater(enc.last_reused, 0)
+        self.assertEqual(enc.expire(time.monotonic() + 30), 0)
+
+    def test_a_server_deletes_them_on_its_own(self):
+        os.environ["STRATA_CACHE_TTL_MINUTES"] = str(0.3 / 60)
+        self.addCleanup(os.environ.pop, "STRATA_CACHE_TTL_MINUTES", None)
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=1 << 20), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.set_family("deepseek41")
+        self.addCleanup(frontend.use_family, None)
+        svc.prepare([{"role": "user", "content": "a long question " * 400}], None, {}, 16, req={CACHE_SCOPE_KEY: "one"})
+        self.assertEqual(len(svc.prompts.entries), 1)
+        time.sleep(1.0)                                  # no request: the timer deletes it
+        self.assertEqual(svc.prompts.entries, [])
 
 
 class Kept(unittest.TestCase):
@@ -227,6 +296,60 @@ class Served(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only the DeepSeek engine"):
             self.svc.prepare(list(self.messages), None, {}, 16, req={CACHE_SCOPE_KEY: "one"})
         self.svc.prepare(list(self.messages), None, {}, 16, req={})
+
+    def test_a_request_that_keeps_nothing_reuses_and_keeps_no_prompt(self):
+        off = {CACHE_SCOPE_KEY: "one", CACHE_RETENTION_KEY: "none"}
+        req = dict(off)
+        self.svc.prepare(list(self.messages), [], {}, 16, req=req)
+        self.assertEqual(self.svc.prompts.entries, [])
+        self.assertNotIn("strata_prefix", req)
+        self.assertNotIn("_restore", req)
+        system = [{"role": "system", "content": "a shared system prompt " * 200}] + self.messages
+        req = {**off, "strata_prefix": {"messages": 1}}
+        self.svc.prepare(list(system), None, {}, 16, req=req)
+        self.assertEqual((self.svc.prompts.entries, "strata_prefix" in req, "_restore" in req), ([], False, False))
+        self.svc.prepare(list(self.messages), None, {}, 16, req={CACHE_SCOPE_KEY: "one"})   # kept as before
+        self.assertEqual(len(self.svc.prompts.entries), 1)
+        turn = self.messages + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more"}]
+        self.svc.prompts.last_reused = 0
+        self.svc.prepare(list(turn), None, {}, 16, req=dict(off))
+        self.assertEqual((self.svc.prompts.last_reused, len(self.svc.prompts.entries)), (0, 1))   # not read either
+
+    def test_a_bad_retention_is_refused_before_anything_is_kept(self):
+        for bad in BAD_RETENTION:
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, CACHE_RETENTION_KEY):
+                self.svc.prepare(list(self.messages), None, {}, 16, req={CACHE_RETENTION_KEY: bad})
+        self.assertEqual(self.svc.prompts.entries, [])
+
+    def test_an_engine_that_cannot_keep_nothing_refuses_it(self):
+        self.svc.set_family(None)
+        with self.assertRaisesRegex(ValueError, "only the DeepSeek engine"):
+            self.svc.prepare(list(self.messages), None, {}, 16, req={CACHE_RETENTION_KEY: "none"})
+        self.svc.prepare(list(self.messages), None, {}, 16, req={CACHE_RETENTION_KEY: "in_memory"})
+
+    def test_a_request_that_keeps_nothing_reaches_the_engine_and_keeps_nothing_over_http(self):
+        httpd = serve(self.svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        off = {CACHE_SCOPE_KEY: "one", CACHE_RETENTION_KEY: "none"}
+        chat = {"messages": self.messages, "max_tokens": 16, **off}
+        anthropic = {"model": "m", "messages": self.messages, "max_tokens": 16, **off}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/chat/completions/input_tokens", chat),
+                           ("/v1/messages", anthropic), ("/v1/messages/count_tokens", anthropic)):
+            status, answer = self.post(port, path, body)
+            self.assertEqual(status, 200, (path, answer))
+            for bad in BAD_RETENTION:
+                self.assertEqual(self.post(port, path, {**body, CACHE_RETENTION_KEY: bad})[0], 400, (path, bad))
+        self.assertEqual(self.svc.prompts.entries, [])
+        self.assertEqual(len(self.engine.seen), 2)
+        for sampling in self.engine.seen:
+            self.assertIn(" keep=0", StrataEngine.sampling_keys(sampling))
+        self.assertEqual(self.svc.metrics()["conversation_cache"]["prompts_kept"], 0)
+        self.assertIn("strata:prompt_cache_prompts 0\n", self.svc.prometheus())
+        self.assertEqual(self.post(port, "/v1/chat/completions", {**chat, CACHE_RETENTION_KEY: "24h"})[0], 200)
+        self.assertNotIn(" keep=0", StrataEngine.sampling_keys(self.engine.seen[-1]))
+        self.assertIn("strata:prompt_cache_prompts 1\n", self.svc.prometheus())
 
     def post(self, port, path, body):
         client = HTTPConnection("127.0.0.1", port, timeout=15)

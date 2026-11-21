@@ -794,6 +794,27 @@ def cache_scope(req) -> str:
     return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
+# "prompt_cache_retention" (OpenAI's name for how long a request's prompt cache lives): "none" is a request that keeps
+# nothing - the prompt encoder neither reuses nor keeps its prompt, and the DeepSeek engine (GEN keep=0) reuses no kept
+# state, keeps none for it and drops its state when it ends, so its cached-token count is 0.  "in_memory" and "24h",
+# OpenAI's own values, and no value at all leave the cache as it is.  Anything else is a 400: read as "cache on", a
+# misspelt opt-out would keep what the caller asked to be kept nowhere.
+CACHE_RETENTION_KEY = "prompt_cache_retention"
+CACHE_RETENTION_NONE = "none"
+CACHE_RETENTION_VALUES = (CACHE_RETENTION_NONE, "in_memory", "24h")
+
+
+def cache_off(req) -> bool:
+    """True: the request asked to keep nothing ("prompt_cache_retention": "none").  A value that is not one of
+    CACHE_RETENTION_VALUES is a ValueError (a 400)."""
+    value = req.get(CACHE_RETENTION_KEY) if isinstance(req, dict) else None
+    if value is None:
+        return False
+    if not isinstance(value, str) or value not in CACHE_RETENTION_VALUES:
+        raise ValueError(f"{CACHE_RETENTION_KEY}: one of {', '.join(CACHE_RETENTION_VALUES)}")
+    return value == CACHE_RETENTION_NONE
+
+
 def restore_point_settings(env=None) -> tuple[bool, int]:
     """(on, tail) from STRATA_DS4_RESTORE_POINTS and STRATA_DS4_RESTORE_TAIL."""
     env = os.environ if env is None else env
@@ -954,6 +975,27 @@ class ConvCacheLog:
             if m:
                 self.state["parked"] = int(m.group(1))
         return dict(self.state)
+
+
+def cache_ttl_setting(env=None) -> float:
+    """STRATA_CACHE_TTL_MINUTES in seconds: how long a kept entry lives after its last use (0: no limit).  The DeepSeek
+    engine reads the same setting for what it keeps."""
+    try:
+        minutes = float(str((os.environ if env is None else env).get("STRATA_CACHE_TTL_MINUTES", "")).strip())
+    except ValueError:
+        return 0.0
+    return minutes * 60.0 if minutes > 0 and minutes != float("inf") else 0.0
+
+
+def expire_on_a_timer(encoder) -> None:
+    """Delete `encoder`'s prompts past their time while nothing encodes (a daemon thread, every ttl/20, 0.1-10 s)."""
+    tick = min(max(encoder.ttl_s / 20.0, 0.1), 10.0)
+
+    def run():
+        while True:
+            time.sleep(tick)
+            encoder.expire()
+    threading.Thread(target=run, name="strata-prompt-expiry", daemon=True).start()
 
 
 def prompt_keep_setting(env=None) -> int | None:
@@ -1786,6 +1828,9 @@ class StrataEngine:
         scope = cache_scope(sampling)
         if scope:
             keys += f" scope={scope}"
+        # "prompt_cache_retention": "none" (Service.prepare checked it): the engine reuses and keeps nothing for it
+        if cache_off(sampling):
+            keys += " keep=0"
         # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
         # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
         k = top_logprobs(sampling)
@@ -4984,8 +5029,11 @@ class Service:
             # STRATA_PROMPT_KEEP: that many instead (a server with many tenants keeps a prompt a conversation
             # in flight or recently counted; each costs its text and ids in RAM)
             slots = prompt_keep_setting() or conversation_slots(engine)
-            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
-                else PromptEncoder(tokenizer)
+            ttl = cache_ttl_setting()                   # STRATA_CACHE_TTL_MINUTES: kept prompts expire too
+            self.prompts = PromptEncoder(tokenizer, keep=slots, ttl_s=ttl) if slots is not None and slots > 0 \
+                else PromptEncoder(tokenizer, ttl_s=ttl)
+            if ttl > 0:
+                expire_on_a_timer(self.prompts)
 
     def set_family(self, family: str | None) -> None:
         """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
@@ -5798,8 +5846,9 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked,
-                                                              getattr(self.engine, "cache_stat", None)),
+                "conversation_cache": {**conversation_cache_view(engine, hist, totals, parked,
+                                                                 getattr(self.engine, "cache_stat", None)),
+                                       "prompts_kept": len(self.prompts.entries) if self.prompts is not None else None},
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5841,6 +5890,9 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        if self.prompts is not None:                    # the encoded prompts the server keeps (STRATA_PROMPT_KEEP)
+            rows.append(("strata:prompt_cache_prompts", "gauge", "Encoded prompts kept for reuse",
+                         len(self.prompts.entries)))
         kept = getattr(self.engine, "cache_stat", None) or {}
         if kept:                                        # the DeepSeek engine's kept conversations (its CACHE line)
             g = kept.get
@@ -5858,6 +5910,8 @@ class Service:
                 ("strata:conversation_cache_evicted_bytes_total", "counter", "Their bytes", g("evicted_bytes", 0)),
                 ("strata:conversation_cache_saved_total", "counter", "Conversations set aside", g("saved", 0)),
                 ("strata:conversation_cache_taken_total", "counter", "Conversations taken back", g("taken", 0)),
+                ("strata:conversation_cache_expired_total", "counter", "Kept entries deleted past their time",
+                 g("expired", 0)),
             ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
@@ -5925,18 +5979,20 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs, store: bool = True, scope: str = "") -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, store: bool = True, scope: str = "",
+                      keep: bool = True) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
-        prompts without adding or replacing one.  `scope` (cache_scope): only that scope's kept prompts are reused."""
+        prompts without adding or replacing one.  `scope` (cache_scope): only that scope's kept prompts are reused.
+        `keep=False` ("prompt_cache_retention": "none"): the kept prompts are neither read nor added to."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
-        if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
+        if self.prompts is not None and keep:   # #567: only what follows the last special shared with a recent prompt
             return self.prompts.encode(prompt, plain, store, scope)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
             self.tok.encode(prompt, parse_special=True)
@@ -6022,8 +6078,11 @@ class Service:
         scope = cache_scope(req)                         # a bad value is a 400 before anything is read or kept
         if scope and self.family != "deepseek41":
             raise ValueError(f"{CACHE_SCOPE_KEY}: only the DeepSeek engine keeps its caches apart by scope")
+        off = cache_off(req)                             # likewise
+        if off and self.family != "deepseek41":
+            raise ValueError(f"{CACHE_RETENTION_KEY}: only the DeepSeek engine can keep nothing of a request")
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, scope=scope)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, scope=scope, keep=not off)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -6130,13 +6189,17 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
+        if off:                                          # nothing kept: no shared start, no restore point
+            req.pop("strata_prefix", None)
+            req.pop("_restore", None)
+        elif self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images \
+                and not ds_pics:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
-        if req is not None:
+        if req is not None and not off:
             self.set_restore_points(req, ids, bool(images) or ds_pics)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -9019,8 +9082,11 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
+            off = cache_off(req)
+            if off and svc.family != "deepseek41":
+                raise ValueError(f"{CACHE_RETENTION_KEY}: only the DeepSeek engine can keep nothing of a request")
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False,
-                                                                   scope=cache_scope(req)))})
+                                                                   scope=cache_scope(req), keep=not off))})
 
         def _anthropic(self, req):
             svc.load()
