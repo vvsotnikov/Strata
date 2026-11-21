@@ -143,6 +143,10 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   A request can keep nothing (`GEN ... keep=0`, which the server sends for `"prompt_cache_retention": "none"`): it reuses no
   kept state, keeps no conversation, shared start, restore point or picture, and its state in the model is dropped when it
   ends. The conversation it takes the model from is set aside as usual.
+  `STRATA_CACHE_TTL_MINUTES=<n>` deletes every kept entry unused for n minutes: conversations in RAM and in the folder
+  (their files removed), shared starts, pictures, and the state a conversation of the model holds after its request
+  ended. The engine sweeps on its own while it waits and before each request, and at start removes folder entries
+  whose last use is older than that; the `CACHE` line counts them as `expired`. Unset or 0: no time limit.
 
 Pictures are on by default: the engine reads them with its own vision tower (no separate picture reader). The tower waits in RAM (about 1 GB of pinned
 memory) and takes its 319 MiB of graphics memory only while a picture is being read, out of the room `--reserve-mib` keeps free; the experts get that room

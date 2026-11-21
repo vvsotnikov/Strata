@@ -216,6 +216,15 @@ struct Lines {
         q.pop_front();
         return true;
     }
+    // next(), waiting at most `ms`: 1 a line, 0 none yet, -1 the input's end
+    int next_for(std::string& l, int ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !q.empty() || eof; })) return 0;
+        if (q.empty()) return -1;
+        l = q.front();
+        q.pop_front();
+        return 1;
+    }
 };
 
 // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
@@ -452,6 +461,11 @@ bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
     return ok;
 }
 
+// seconds on the steady clock: when a kept entry was last used (STRATA_CACHE_TTL_MINUTES)
+static double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // the encoded spans, the latest few (a conversation sends its pictures with every turn), each the scope's that
 // encoded it: the same picture from another scope is encoded again.  STRATA_DS4_PICTURE_KEEP (8): how many are kept.
 // Past that the scope that holds the most gives up its least recently used, so a scope that fills the cache makes
@@ -465,6 +479,7 @@ struct SpanCache {
     struct Key {
         std::string scope;
         uint64_t hash;
+        double last = 0;   // (when it was last used, seconds on the steady clock)
     };
     std::deque<std::pair<Key, std::shared_ptr<const std::vector<uint16_t>>>> q;
     std::shared_ptr<const std::vector<uint16_t>> get(strata::ds4::Model& m, const std::string& scope, const Pic& p,
@@ -478,12 +493,12 @@ struct SpanCache {
             if (q[i].first.hash == p.hash && q[i].first.scope == scope) {
                 auto r = q[i].second;
                 q.erase(q.begin() + (long) i);
-                q.emplace_front(Key{scope, p.hash}, r);
+                q.emplace_front(Key{scope, p.hash, now_s()}, r);
                 return r;
             }
         auto rows = std::make_shared<std::vector<uint16_t>>();
         if (!m.encode_image(p.rgb.data(), p.width, p.height, *rows, err)) return nullptr;
-        q.emplace_front(Key{scope, p.hash}, rows);
+        q.emplace_front(Key{scope, p.hash, now_s()}, rows);
         while (q.size() > keep) {
             std::unordered_map<std::string, size_t> held;
             for (const auto& e : q) ++held[e.first.scope];
@@ -493,6 +508,15 @@ struct SpanCache {
             q.erase(q.begin() + (long) out);
         }
         return rows;
+    }
+    // the pictures unused since `cutoff` are given up: how many
+    size_t expire(double cutoff) {
+        const size_t before = q.size();
+        q.erase(std::remove_if(q.begin(), q.end(), [&](const auto& e) { return e.first.last < cutoff; }), q.end());
+        return before - q.size();
+    }
+    bool stale(double cutoff) const {
+        return std::any_of(q.begin(), q.end(), [&](const auto& e) { return e.first.last < cutoff; });
     }
 };
 
@@ -605,12 +629,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // CACHE SCOPES: seq_scope names the scope that read the state each conversation of the model holds, and every
     // slot and shared start carries its own; a request reads on only from what its own scope left (GEN scope=<id>).
     std::vector<std::string> seq_scope((size_t) std::max(1, m.seq_count()));
+    std::vector<double> seq_last((size_t) std::max(1, m.seq_count()), 0.0);   // (when each conversation's request ended)
     const auto state_scope = [&]() -> std::string& { return seq_scope[(size_t) m.seq_bound()]; };
     std::fprintf(stderr, "ds4 serve: cache scopes on: a request reuses only what its own scope read (GEN scope=<id>)\n");
     std::fprintf(stderr, "ds4 serve: cache opt-out on: a request with keep=0 reuses nothing and leaves nothing kept\n");
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
+    // STRATA_CACHE_TTL_MINUTES: how long kept state lives after its last use (0 or unset: until it is given up for room)
+    const uint64_t cache_ttl_s = (uint64_t) std::max(0.0, std::round(env_num("STRATA_CACHE_TTL_MINUTES", 0) * 60.0));
+    const int expire_tick_ms = (int) std::clamp<double>((double) cache_ttl_s * 1000.0 / 20.0, 100.0, 10000.0);
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
@@ -625,6 +653,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
         std::string scope;                            // the scope that read it: no other takes it back
+        double last = 0;                              // when it was last used (now_s)
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
@@ -680,7 +709,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return total;
     };
     // what the caches hold, for the server's metrics: a CACHE line on stdout after each request's reuse was settled
-    uint64_t n_saved = 0, n_taken = 0, n_evicted = 0, evicted_bytes = 0;
+    uint64_t n_saved = 0, n_taken = 0, n_evicted = 0, evicted_bytes = 0, n_expired = 0;
     // WHO GIVES WAY when a cap is reached: the scope that holds the most bytes of that part (RAM, or the folder), its
     // least recently used conversation.  A scope that fills the cache makes room out of its own, so no scope loses
     // what it keeps to another's traffic while it holds less than that one.  `keep`: a path never given up
@@ -780,6 +809,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 slot_drop(i);
         slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), owner});
         slots.back().data = buf;
+        slots.back().last = now_s();
         while (true) {   // past the cap: slot_victim's conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
@@ -851,6 +881,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         whole = len == whole_len;
         ++n_taken;
         slots[best].used = ++slot_clock;
+        slots[best].last = now_s();
         if (!ram) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
             fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
@@ -876,6 +907,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<uint8_t> data;
         uint64_t used = 0;
         std::string scope;   // the scope that read it: no other takes it back
+        double last = 0;     // when it was last used (now_s)
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
@@ -910,6 +942,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (Prefix& p : prefixes)
             if (p.scope == owner && p.tokens == t) {
                 p.used = ++prefix_clock;
+                p.last = now_s();
                 return;
             }
         const auto t0 = std::chrono::steady_clock::now();
@@ -924,6 +957,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         p.tokens = t;
         p.scope = owner;
         p.used = ++prefix_clock;
+        p.last = now_s();
         prefixes.push_back(std::move(p));
         uint64_t total = 0;
         for (const Prefix& x : prefixes) total += x.data.size();
@@ -958,6 +992,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return false;
         }
         p.used = ++prefix_clock;
+        p.last = now_s();
         std::fprintf(stderr, "ds4: took back a %zu-token shared start (%.2f s)\n", p.tokens.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return true;
@@ -980,12 +1015,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         std::printf("CACHE ram=%d ram_bytes=%llu ram_cap=%d folder=%d folder_bytes=%llu folder_cap_bytes=%llu starts=%zu "
                     "start_bytes=%llu starts_cap=%d start_cap_bytes=%llu pictures=%zu pictures_cap=%zu scopes=%zu saved=%llu "
-                    "taken=%llu evicted=%llu evicted_bytes=%llu\n",
+                    "taken=%llu evicted=%llu evicted_bytes=%llu expired=%llu ttl_s=%llu\n",
                     ram, (unsigned long long) ram_bytes, slot_max, disk, (unsigned long long) slot_folder_bytes(),
                     (unsigned long long) (slot_max > 0 ? slot_budget : 0), prefixes.size(), (unsigned long long) start_bytes,
                     prefix_max, (unsigned long long) prefix_budget, spans.q.size(), spans.keep, owners.size(),
                     (unsigned long long) n_saved, (unsigned long long) n_taken, (unsigned long long) n_evicted,
-                    (unsigned long long) evicted_bytes);
+                    (unsigned long long) evicted_bytes, (unsigned long long) n_expired,
+                    (unsigned long long) cache_ttl_s);
         std::fflush(stdout);
     };
     if (slot_max > 0) {
@@ -1042,6 +1078,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 total += fd.bytes;
                 slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks),
                                  std::move(fd.scope)});
+                // (its age counts from its last use, which its .meta's time records: the folder outlives an engine
+                //  restart inside the container)
+                slots.back().last = now_s() - 86400.0 * slot_age_days(meta_of(slots.back().path));
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -1049,6 +1088,42 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 msg += ", " + std::to_string(refused) + " not this model's, incomplete or without a scope - removed";
             note(msg);
             slot_trim("");   // (the folder over STRATA_DS4_SLOT_GB: slot_victim's conversation goes first)
+        }
+    }
+    // EXPIRY: STRATA_CACHE_TTL_MINUTES (unset or 0: none) - every kept entry unused for that long is deleted: a
+    // conversation in RAM (its buffer freed) or in the folder (its .bin and .meta removed), a shared start, a picture's
+    // rows, and the state a conversation of the model holds once its request has ended.  The sweep runs between
+    // requests and, while the engine waits, every `expire_tick_ms`; a request sweeps first, so it never reuses an
+    // entry past its time
+    const auto expire_kept = [&](double cutoff) -> size_t {
+        size_t gone = 0;
+        for (size_t i = slots.size(); i-- > 0;)
+            if (slots[i].last < cutoff) {
+                slot_drop(i);
+                ++gone;
+            }
+        const size_t before = prefixes.size();
+        prefixes.erase(std::remove_if(prefixes.begin(), prefixes.end(), [&](const Prefix& x) { return x.last < cutoff; }),
+                       prefixes.end());
+        gone += before - prefixes.size() + spans.expire(cutoff);
+        n_expired += gone;
+        return gone;
+    };
+    const auto kept_stale = [&](double cutoff) {
+        return std::any_of(slots.begin(), slots.end(), [&](const Slot& x) { return x.last < cutoff; }) ||
+               std::any_of(prefixes.begin(), prefixes.end(), [&](const Prefix& x) { return x.last < cutoff; }) ||
+               spans.stale(cutoff);
+    };
+    // conversation `i` of the model holds a state its scope may go on from, unused since `cutoff`
+    const auto seq_stale = [&](int i, double cutoff) {
+        return !m.seq_tokens(i).empty() && seq_last[(size_t) i] < cutoff;
+    };
+    if (cache_ttl_s > 0) {
+        std::fprintf(stderr, "ds4 serve: cache expiry on: kept state unused for %llu s is deleted\n",
+                     (unsigned long long) cache_ttl_s);
+        if (slot_max > 0) {   // (what a previous run left, past its time)
+            const size_t gone = expire_kept(now_s() - (double) cache_ttl_s);
+            if (gone > 0) note(std::to_string(gone) + " kept conversation(s) past STRATA_CACHE_TTL_MINUTES removed");
         }
     }
     cache_line();   // (what a previous run left in the folder, before the first request)
@@ -1489,7 +1564,27 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const bool multi = m.seq_count() > 1;
     while (!multi) {   // one conversation: a request at a time
         settle_start();   // (nothing in flight: this is the idle)
-        const bool have_line = in.next(line);
+        bool have_line = false;
+        for (;;) {
+            const int got = cache_ttl_s > 0 ? in.next_for(line, expire_tick_ms) : (in.next(line) ? 1 : -1);
+            if (got != 0) {
+                have_line = got > 0;
+                break;
+            }
+            const double cutoff = now_s() - (double) cache_ttl_s;
+            if (kept_stale(cutoff) || seq_stale(m.seq_bound(), cutoff)) {   // (the model is the idle's: stopped first)
+                settle_stop();
+                expire_kept(cutoff);
+                if (seq_stale(m.seq_bound(), cutoff)) {
+                    m.reset();
+                    held.clear();
+                    state_scope().clear();
+                    ++n_expired;
+                }
+                cache_line();
+                settle_start();
+            }
+        }
         settle_stop();    // (a line arrived, or the input closed)
         if (!have_line) break;
         if (line == "QUIT") break;
@@ -1507,6 +1602,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
+        if (cache_ttl_s > 0) {   // (nothing past its time is reused)
+            const double cutoff = now_s() - (double) cache_ttl_s;
+            expire_kept(cutoff);
+            if (seq_stale(m.seq_bound(), cutoff)) {
+                m.reset();
+                held.clear();
+                state_scope().clear();
+                ++n_expired;
+            }
+        }
         Prompt P;
         if (!prompt_in(r, geni, "", [&in] { return in.stop.load(); }, P)) continue;
         const double t0 = P.t0;
@@ -1625,6 +1730,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held.clear();
         }
         if (!r.keep) state_scope().clear();
+        seq_last[(size_t) m.seq_bound()] = now_s();
         m.save_profile();
     }
     // ---- SEVERAL CONVERSATIONS AT ONCE (--parallel <n>: READY ... multi=<n>).  GEN lines carry rid=<id>, and every
@@ -1698,6 +1804,25 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         };
+        // what is past its time is deleted: the kept parts, and the state of every conversation no request runs in
+        const auto expire_all = [&]() -> bool {
+            const double cutoff = now_s() - (double) cache_ttl_s;
+            bool idle_stale = false;
+            for (int s = 0; s < nseq; ++s) idle_stale = idle_stale || (seq_rid[(size_t) s] < 0 && seq_stale(s, cutoff));
+            if (!idle_stale && !kept_stale(cutoff)) return false;
+            expire_kept(cutoff);
+            const int was = m.seq_bound();
+            for (int s = 0; s < nseq; ++s)
+                if (seq_rid[(size_t) s] < 0 && seq_stale(s, cutoff)) {
+                    bind(s);
+                    m.reset();
+                    held.clear();
+                    state_scope().clear();
+                    ++n_expired;
+                }
+            bind(was);
+            return true;
+        };
         const auto release = [&](const Act& a) {   // (its conversation free for the next request)
             if (!a.r.keep) {   // (keep=0: its state goes with it, so nothing can set it aside later)
                 bind(a.seq);
@@ -1707,6 +1832,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             seq_rid[(size_t) a.seq] = -1;
             seq_used[(size_t) a.seq] = ++use_clock;
+            seq_last[(size_t) a.seq] = now_s();
             in.forget(a.r.rid);
         };
         const auto finish_act = [&](Act& a) {
@@ -1960,6 +2086,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             // the conversation: the idle one the prompt reuses the most of (its whole state continued, else a
             // checkpoint it can go back to), else an empty one, else the least recently used
+            if (cache_ttl_s > 0) expire_all();   // (nothing past its time is reused)
             int best = -1;
             int64_t best_u = -1;
             for (int s = 0; s < nseq; ++s) {
@@ -2119,12 +2246,41 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 eng.add([&] { on_line("QUIT"); }, kLine);
             }
         });
+        // (while requests run and while the engine waits: a sweep between two turns, like a line)
+        std::atomic<bool> timer_end{false};
+        std::thread timer;
+        if (cache_ttl_s > 0)
+            timer = std::thread([&] {
+                while (!timer_end.load()) {
+                    for (int waited = 0; waited < expire_tick_ms && !timer_end.load(); waited += 50)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    if (timer_end.load()) break;
+                    eng.add([&] {
+                        const bool idle = acts.empty();
+                        const double cutoff = now_s() - (double) cache_ttl_s;
+                        bool due = kept_stale(cutoff);
+                        for (int s = 0; s < nseq; ++s) due = due || (seq_rid[(size_t) s] < 0 && seq_stale(s, cutoff));
+                        if (!due) return;
+                        if (idle) settle_stop();   // (the idle settle uses the model)
+                        expire_all();
+                        cache_line();
+                        if (idle && !quit) settle_start();
+                    }, kLine);
+                }
+            });
         eng.run();
+        timer_end.store(true);
+        if (timer.joinable()) timer.join();
         reader.join();
         settle_stop();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
+    if (cache_ttl_s > 0) {
+        const double cutoff = now_s() - (double) cache_ttl_s;
+        expire_kept(cutoff);
+        if (seq_stale(m.seq_bound(), cutoff)) m.reset();
+    }
     if (slot_max > 0) {
         if (held.empty()) slot_put(" as the engine ended");
         size_t written = 0;

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 EXE = None
@@ -356,6 +357,51 @@ class Scopes(unittest.TestCase):
         self.assertEqual(ask(232, " keep=0"), 2)          # encoded again: its rows were not kept
         self.assertEqual(ask(234), 3)                      # nor for the scope's next request
         self.assertEqual(ask(236), 3)                      # whose rows are kept as before
+
+
+    def test_kept_state_past_its_time_is_deleted(self):
+        ttl = 3                                          # seconds (STRATA_CACHE_TTL_MINUTES is 0.05)
+        log = os.path.join(self.dir, "encodes.log")
+        e = self.engine({"STRATA_CACHE_TTL_MINUTES": str(ttl / 60), "STRATA_DS4_SLOT_CAP": "1",
+                         "DS4_FAKE_ENCODE_LOG": log})
+        pictures = os.path.join(self.dir, "pictures.dsi")
+        with open(pictures, "wb") as f:
+            f.write(b"DSI1" + struct.pack("<i", 1) + struct.pack("<qii", 5, 2, 2) + bytes(12))
+        start = prompt(240, 1500)
+        convs = [prompt(241 + i, 2000) for i in range(6)]
+        self.assertEqual(e.gen(start + prompt(250, 300), "aaaa", " shared=1500"), 0)
+        for p in convs:                                  # in the model, in RAM and in the folder
+            self.assertEqual(e.gen(p, "aaaa"), 0)
+        self.assertEqual(e.gen(prompt(251, 5) + [IMAGE_TOKEN] * SPAN + prompt(252, 40), "aaaa", pictures=pictures), 0)
+        slots = os.path.join(self.dir, "slots")
+        self.assertGreater(len(os.listdir(slots)), 0)
+        self.assertGreater(e.cache["starts"], 0)
+        time.sleep(ttl + 1.5)                            # no request: the engine deletes them on its own
+        self.assertEqual(os.listdir(slots), [])
+        for p in convs:                                  # nothing past its time is reused, the model's own included
+            self.assertEqual(e.gen(p + prompt(253, 50), "aaaa"), 0)
+        self.assertEqual(e.gen(start + prompt(254, 300), "aaaa", " shared=1500"), 0)
+        self.assertEqual(e.gen(prompt(255, 5) + [IMAGE_TOKEN] * SPAN + prompt(256, 40), "aaaa", pictures=pictures), 0)
+        with open(log) as f:
+            self.assertEqual(len(f.readlines()), 2)      # the picture was encoded again
+        self.assertGreater(e.cache["expired"], 0)
+        self.assertEqual(e.cache["ttl_s"], ttl)
+        # within its time an entry is reused as before
+        self.assertGreaterEqual(e.gen(convs[-1] + prompt(253, 50) + prompt(257, 50), "aaaa"), len(convs[-1]))
+
+    def test_a_folder_left_past_its_time_is_emptied_at_start(self):
+        e = self.engine()
+        for i in range(3):
+            self.assertEqual(e.gen(prompt(260 + i, 2000), "aaaa"), 0)
+        e.quit()
+        slots = os.path.join(self.dir, "slots")
+        self.assertGreater(len(os.listdir(slots)), 0)
+        old = time.time() - 120
+        for name in os.listdir(slots):
+            os.utime(os.path.join(slots, name), (old, old))
+        e = self.engine({"STRATA_CACHE_TTL_MINUTES": "1"})
+        self.assertEqual(e.gen(prompt(260, 2000) + prompt(263, 50), "aaaa"), 0)
+        self.assertEqual(os.listdir(slots), [])
 
 
 class ParallelScopes(Scopes):
