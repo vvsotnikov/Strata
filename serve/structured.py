@@ -25,7 +25,47 @@ class _ObjectOnly:
 
 class _ObjectError:
     absolute_path = ()
+    validator = "type"
     message = "the answer is not a JSON object"
+
+
+# Error text names where and which rule, never a value: the router logs these messages and keeps them with a failed
+# request's spend record, and a value would be the request's or the model's own text.
+def _names(schema) -> set:
+    """Every name the schema itself spells: its keys at any depth and the strings of its `required` lists."""
+    out, stack = set(), [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            out.update(k for k in node if isinstance(k, str))
+            required = node.get("required")
+            if isinstance(required, list):
+                out.update(r for r in required if isinstance(r, str))
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return out
+
+
+def _pointer(parts, names) -> str:
+    """A JSON pointer to the failing place: indexes as they are, a key only if the schema names it, else `*` (a key
+    the model made up is its text)."""
+    def one(part):
+        if isinstance(part, int) and not isinstance(part, bool):
+            return str(part)
+        if isinstance(part, str) and part in names:
+            return part.replace("~", "~0").replace("/", "~1")
+        return "*"
+    return "/" + "/".join(one(part) for part in parts)
+
+
+class _NotJson(ValueError):
+    """Why the answer is not JSON, in words that quote none of it."""
+
+
+def _rule(error) -> str:
+    rule = getattr(error, "validator", None)
+    return rule if isinstance(rule, str) and rule.isascii() and rule.replace("$", "").isalnum() else "unknown"
 
 
 class _Repairing:
@@ -170,7 +210,9 @@ def prepare_format(response_format, messages, with_tools=False):
             cls.check_schema(schema)
             validator = cls(schema, registry=Registry(retrieve=no_remote))
         except SchemaError as exc:
-            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+            where = _pointer(getattr(exc, "absolute_path", ()), _names(schema))
+            raise ValueError(f"invalid response_format schema at {where}: it breaks the {_rule(exc)!r} rule of "
+                             "the JSON Schema meta-schema") from exc
     directive = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
                  "Use every required field, correct types, and only allowed fields. "
@@ -239,12 +281,17 @@ def validated_json(text, validator, finish):
         obj = {}
         for key, value in items:
             if key in obj:
-                raise ValueError(f"duplicate JSON key: {key}")
+                raise _NotJson("an object has the same key twice")
             obj[key] = value
         return obj
 
     def constant(value):
-        raise ValueError(f"invalid JSON constant: {value}")
+        raise _NotJson("NaN and Infinity are not JSON")
+
+    def why(exc):   # (what is wrong and where, none of the text: a JSONDecodeError's own message quotes none either)
+        if isinstance(exc, json.JSONDecodeError):
+            return f"{exc.msg} at line {exc.lineno} column {exc.colno}"
+        return str(exc) if isinstance(exc, _NotJson) else f"a value JSON cannot hold ({type(exc).__name__})"
 
     if finish != "stop":
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
@@ -262,12 +309,13 @@ def validated_json(text, validator, finish):
             except (ValueError, TypeError):
                 value = None
         if value is None:
-            raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
+            raise StructuredOutputError(f"model did not return valid JSON: {why(exc)}") from exc
     try:
         error = next(validator.iter_errors(value), None)
     except Exception as exc:
-        raise StructuredOutputError(f"could not validate structured output: {exc}") from exc
+        raise StructuredOutputError(f"could not validate structured output ({type(exc).__name__})") from exc
     if error is not None:
-        path = "/" + "/".join(str(part) for part in error.absolute_path)
-        raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
+        path = _pointer(error.absolute_path, _names(getattr(getattr(validator, "inner", validator), "schema", None)))
+        raise StructuredOutputError(f"model output failed the JSON Schema at {path}: it breaks the {_rule(error)!r} "
+                                    "rule")
     return canonical
